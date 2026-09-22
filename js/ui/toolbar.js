@@ -11,9 +11,9 @@ const ICONS = {
 
 const TOOLS = [
   { key: 'select', label: 'Select', enabled: true },
-  { key: 'text', label: 'Edit text', enabled: false },
-  { key: 'redact', label: 'Redact and replace', enabled: false },
-  { key: 'image', label: 'Edit images', enabled: false },
+  { key: 'text', label: 'Edit text', enabled: true },
+  { key: 'redact', label: 'Redact and replace', enabled: true },
+  { key: 'image', label: 'Edit images', enabled: true },
   { key: 'insertPage', label: 'Insert page', enabled: true },
   { key: 'rotate', label: 'Rotate page', enabled: true },
   { key: 'merge', label: 'Merge documents', enabled: true },
@@ -24,10 +24,17 @@ function icon(key, extra = '') {
   return `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" ${extra}>${ICONS[key]}</svg>`;
 }
 
+function fileOpIcon(path) {
+  return `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${path}</svg>`;
+}
+
 let lastSignature = null;
 
 export function renderToolbar(container, state, actions) {
-  const signature = JSON.stringify([state.activeTool, state.isLoaded, state.fileName, state.selectedPageIndex]);
+  const signature = JSON.stringify([
+    state.activeTool, state.isLoaded, state.fileName, state.selectedPageIndex,
+    state.isDirty, state.canUndo, state.canRedo,
+  ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
   lastSignature = signature;
 
@@ -38,7 +45,30 @@ export function renderToolbar(container, state, actions) {
       <span class="brand-name">Schurco PDF Editor</span>
     </div>
     <div class="toolbar-divider"></div>
-    <span class="doc-name">${state.fileName || 'No document open'}</span>
+
+    <div class="tool-pill">
+      <button class="tool-btn" data-role="open" aria-label="Open PDF" title="Open a PDF">
+        ${fileOpIcon('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>')}
+      </button>
+      <button class="tool-btn" data-role="save" aria-label="Save" title="${state.isDirty ? 'Save' : 'No changes to save'}" ${state.isLoaded && state.isDirty ? '' : 'disabled'}>
+        ${fileOpIcon('<path d="M5 3h11l3 3v13a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M8 3v5h7V3"/><path d="M7 21v-7h10v7"/>')}
+      </button>
+      <button class="tool-btn" data-role="close" aria-label="Close document" title="Close document" ${state.isLoaded ? '' : 'disabled'}>
+        ${fileOpIcon('<path d="M6 6l12 12M18 6L6 18"/>')}
+      </button>
+    </div>
+
+    <div class="tool-pill">
+      <button class="tool-btn" data-role="undo" aria-label="Undo" title="Undo" ${state.canUndo ? '' : 'disabled'}>
+        ${fileOpIcon('<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>')}
+      </button>
+      <button class="tool-btn" data-role="redo" aria-label="Redo" title="Redo" ${state.canRedo ? '' : 'disabled'}>
+        ${fileOpIcon('<path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 15-6.7L21 13"/>')}
+      </button>
+    </div>
+
+    <div class="toolbar-divider"></div>
+    <span class="doc-name">${state.fileName || 'No document open'}${state.isDirty ? ' •' : ''}</span>
     <div class="toolbar-spacer"></div>
     <div class="tool-pill">
       ${TOOLS.map((t) => `
@@ -67,4 +97,9 @@ export function renderToolbar(container, state, actions) {
     btn.addEventListener('click', () => actions.onToolClick(btn.dataset.tool));
   });
   container.querySelector('[data-role="export"]').addEventListener('click', () => actions.onExport());
+  container.querySelector('[data-role="open"]').addEventListener('click', () => actions.onOpenFileClick());
+  container.querySelector('[data-role="save"]').addEventListener('click', () => actions.onSave());
+  container.querySelector('[data-role="close"]').addEventListener('click', () => actions.onCloseDocument());
+  container.querySelector('[data-role="undo"]').addEventListener('click', () => actions.onUndo());
+  container.querySelector('[data-role="redo"]').addEventListener('click', () => actions.onRedo());
 }

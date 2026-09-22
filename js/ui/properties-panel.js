@@ -1,14 +1,17 @@
-import { PAGE_SIZES } from '../pdf-engine.js';
+import { PAGE_SIZES, FONT_VARIANTS } from '../pdf-engine.js';
 
 let lastSignature = null;
 
 export function renderPropertiesPanel(container, state, actions) {
-  const signature = JSON.stringify([state.isLoaded, state.selectedPageIndex, state.docRevision]);
+  const signature = JSON.stringify([
+    state.isLoaded, state.selectedPageIndex, state.docRevision, state.activeTool,
+    state.textEdit, state.redactColor, state.selectedImage,
+  ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
   lastSignature = signature;
   container.dataset.rendered = '1';
 
-  if (!state.isLoaded || state.selectedPageIndex === null) {
+  if (!state.isLoaded) {
     container.innerHTML = `
       <span class="panel-section-title">Page properties</span>
       <span class="panel-empty">Open a PDF and select a page to see its properties.</span>
@@ -16,9 +19,93 @@ export function renderPropertiesPanel(container, state, actions) {
     return;
   }
 
+  if (state.activeTool === 'text') return renderTextPanel(container, state, actions);
+  if (state.activeTool === 'redact') return renderRedactPanel(container, state, actions);
+  if (state.activeTool === 'image') return renderImagePanel(container, state, actions);
+  return renderPagePanel(container, state, actions);
+}
+
+function renderTextPanel(container, state, actions) {
+  const te = state.textEdit;
+  if (!te) {
+    container.innerHTML = `
+      <span class="panel-section-title">Text properties</span>
+      <span class="panel-empty">Click text on the page to edit it. The original text is removed from the file, not just covered, once you export.</span>
+    `;
+    return;
+  }
+
+  const families = Object.keys(FONT_VARIANTS);
+
+  container.innerHTML = `
+    <span class="panel-section-title">Text properties</span>
+
+    <div class="field">
+      <span class="field-label">Font</span>
+      <select class="field-select" data-role="font" style="border:1px solid var(--line);appearance:none;">
+        ${families.map((f) => `<option value="${f}" ${te.fontFamily === f ? 'selected' : ''}>${f}</option>`).join('')}
+      </select>
+    </div>
+
+    <div class="field-row">
+      <div class="field">
+        <span class="field-label">Size</span>
+        <input type="number" min="6" max="96" class="field-box" data-role="size" value="${te.fontSize}" style="border:1px solid var(--line);" />
+      </div>
+      <div class="field">
+        <span class="field-label">Colour</span>
+        <input type="color" data-role="color" value="${te.color}" class="swatch" style="padding:0;cursor:pointer;" />
+      </div>
+    </div>
+
+    <div class="style-row">
+      <button class="style-btn ${te.bold ? 'active' : ''}" data-role="bold" aria-label="Bold" aria-pressed="${te.bold}"><span>B</span></button>
+      <button class="style-btn ${te.italic ? 'active' : ''}" data-role="italic" aria-label="Italic" aria-pressed="${te.italic}"><span style="font-style:italic;">I</span></button>
+      <button class="style-btn ${te.underline ? 'active' : ''}" data-role="underline" aria-label="Underline" aria-pressed="${te.underline}"><span style="text-decoration:underline;">U</span></button>
+    </div>
+
+    <span class="field-hint">Editing “${te.text.length > 40 ? te.text.slice(0, 40) + '…' : te.text}” on page ${te.pageIndex + 1}. Press Enter to apply, Esc to cancel.</span>
+  `;
+
+  container.querySelector('[data-role="font"]').addEventListener('change', (e) => actions.onTextStyleChange({ fontFamily: e.target.value }));
+  container.querySelector('[data-role="size"]').addEventListener('change', (e) => actions.onTextStyleChange({ fontSize: Math.max(6, Math.min(96, Number(e.target.value) || te.fontSize)) }));
+  container.querySelector('[data-role="color"]').addEventListener('input', (e) => actions.onTextStyleChange({ color: e.target.value }));
+  container.querySelector('[data-role="bold"]').addEventListener('click', () => actions.onTextStyleChange({ bold: !te.bold }));
+  container.querySelector('[data-role="italic"]').addEventListener('click', () => actions.onTextStyleChange({ italic: !te.italic }));
+  container.querySelector('[data-role="underline"]').addEventListener('click', () => actions.onTextStyleChange({ underline: !te.underline }));
+}
+
+function renderRedactPanel(container, state, actions) {
+  container.innerHTML = `
+    <span class="panel-section-title">Redaction</span>
+    <span class="panel-empty">Drag a box over anything on the page you want gone. It's permanently removed from the file — not just covered — once you export, so this can't be undone by re-opening the PDF elsewhere.</span>
+
+    <div class="field">
+      <span class="field-label">Redaction colour</span>
+      <input type="color" data-role="color" value="${state.redactColor}" class="swatch" style="padding:0;cursor:pointer;" />
+    </div>
+  `;
+  container.querySelector('[data-role="color"]').addEventListener('input', (e) => actions.onRedactColorChange(e.target.value));
+}
+
+function renderImagePanel(container, state, actions) {
+  container.innerHTML = `
+    <span class="panel-section-title">Image</span>
+    <span class="panel-empty">${state.selectedImage ? 'Use the icons on the image to replace, crop, or delete it.' : 'Click an image on the page to replace, crop, or delete it.'}</span>
+    <span class="field-hint">Replacing, cropping, or deleting also removes the original image data from the file on export.</span>
+  `;
+}
+
+function renderPagePanel(container, state, actions) {
   const idx = state.selectedPageIndex;
   const info = state.pages[idx];
-  if (!info) return;
+  if (!info) {
+    container.innerHTML = `
+      <span class="panel-section-title">Page properties</span>
+      <span class="panel-empty">Open a PDF and select a page to see its properties.</span>
+    `;
+    return;
+  }
 
   const sizeKeys = Object.keys(PAGE_SIZES);
   const matchedKey = sizeKeys.find((k) => info.sizeLabel.startsWith(k)) || '';
@@ -55,7 +142,7 @@ export function renderPropertiesPanel(container, state, actions) {
     <div class="section-divider"></div>
 
     <span class="panel-section-title">Text properties</span>
-    <span class="panel-empty">Available once text editing ships in a later phase.</span>
+    <span class="panel-empty">Select the Edit Text tool, then click text on the page.</span>
 
     <div class="section-divider"></div>
 

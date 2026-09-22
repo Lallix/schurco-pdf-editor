@@ -17,6 +17,16 @@ export const state = {
   isBusy: false,
   busyMessage: '',
   docRevision: 0, // bumped on every load/mutation so UI modules know to fully re-render
+  isDirty: false,
+  canUndo: false,
+  canRedo: false,
+
+  // Phase 2 interactive tool state
+  textEdit: null,      // { pageIndex, rect, text, fontFamily, fontSize, color, bold, italic, underline }
+  redactDraft: null,   // { pageIndex, rect } — drawn, awaiting confirm
+  redactColor: '#111111',
+  selectedImage: null, // { pageIndex, rect } — image tool selection
+  cropDraft: null,     // { pageIndex, originalRect, keepRect? } — crop in progress
 };
 
 export function subscribe(fn) {

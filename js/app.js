@@ -5,6 +5,7 @@ import { renderSidebar } from './ui/sidebar.js';
 import { renderCanvas } from './ui/canvas.js';
 import { renderPropertiesPanel } from './ui/properties-panel.js';
 import { openInsertPageModal, openMergeModal } from './ui/modals.js';
+import { supportsFileSystemAccess, pickPdfToOpen, pickPdfSaveLocation, writeToHandle } from './file-io.js';
 
 const els = {
   toolbar: document.getElementById('toolbar'),
@@ -12,9 +13,22 @@ const els = {
   canvasArea: document.getElementById('canvas-area'),
   propertiesPanel: document.getElementById('properties-panel'),
   fileInput: document.getElementById('file-input'),
+  openFileInput: document.getElementById('open-file-input'),
+  imageInput: document.getElementById('image-input'),
   busyOverlay: document.getElementById('busy-overlay'),
   busyMessage: document.getElementById('busy-message'),
 };
+
+let pendingImageReplace = null; // { pageIndex, rect } captured just before opening the image file picker
+let fileHandle = null; // FileSystemFileHandle for the open document, if opened/saved via that API
+
+function resetToolOverlays() {
+  update({ textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null });
+}
+
+function confirmDiscardIfDirty(message) {
+  return !state.isDirty || window.confirm(message);
+}
 
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
@@ -57,6 +71,9 @@ async function refreshAll(preferredSelectedIndex) {
     isLoaded: pageCount > 0,
     fileName: engine.getFileName(),
     docRevision: state.docRevision + 1,
+    isDirty: engine.isDirty(),
+    canUndo: engine.canUndo(),
+    canRedo: engine.canRedo(),
   });
 }
 
@@ -82,10 +99,12 @@ async function openOrMergeFiles(fileList) {
   });
 }
 
+const STICKY_TOOLS = ['select', 'text', 'redact', 'image'];
+
 const actions = {
   onToolClick(key) {
-    if (key === 'select') {
-      update({ activeTool: 'select' });
+    if (STICKY_TOOLS.includes(key)) {
+      update({ activeTool: key, textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null });
       return;
     }
     if (key === 'rotate') {
@@ -124,7 +143,7 @@ const actions = {
       });
       return;
     }
-    // Edit text / Redact / Edit images / OCR are disabled in Phase 1 — no-op.
+    // OCR is disabled until Phase 3 — no-op.
   },
 
   onExport() {
@@ -140,8 +159,23 @@ const actions = {
     });
   },
 
-  onOpenFileClick() {
-    els.fileInput.click();
+  async onOpenFileClick() {
+    if (!confirmDiscardIfDirty('You have unsaved changes. Open a different PDF and discard them?')) return;
+
+    if (supportsFileSystemAccess()) {
+      const result = await pickPdfToOpen();
+      if (!result || result.cancelled) return;
+      await withBusy('Loading…', async () => {
+        await engine.loadFromBytes(result.bytes, result.name);
+        fileHandle = result.handle;
+        update({ activeTool: 'select' });
+        resetToolOverlays();
+        await refreshAll(0);
+      });
+      return;
+    }
+    fileHandle = null;
+    els.openFileInput.click();
   },
 
   onSelectPage(i) {
@@ -191,6 +225,183 @@ const actions = {
       await refreshAll(idx);
     });
   },
+
+  // --- Text editing ---------------------------------------------------
+
+  onStartTextEdit(pageIndex, run) {
+    update({
+      textEdit: {
+        pageIndex,
+        rect: run.rect,
+        text: run.text,
+        fontFamily: 'Helvetica',
+        fontSize: run.fontSize,
+        color: '#000000',
+        bold: run.bold,
+        italic: run.italic,
+        underline: false,
+      },
+    });
+  },
+
+  onTextStyleChange(patch) {
+    if (!state.textEdit) return;
+    update({ textEdit: { ...state.textEdit, ...patch } });
+  },
+
+  onCancelTextEdit() {
+    update({ textEdit: null });
+  },
+
+  async onCommitTextEdit(pageIndex, rect, text, style) {
+    await withBusy('Applying edit…', async () => {
+      await engine.commitTextEdit(pageIndex, rect, text, style);
+      update({ textEdit: null });
+      await refreshAll(pageIndex);
+    });
+  },
+
+  // --- Redaction --------------------------------------------------------
+
+  onRedactDrawn(pageIndex, rect) {
+    update({ redactDraft: { pageIndex, rect } });
+  },
+
+  onCancelRedaction() {
+    update({ redactDraft: null });
+  },
+
+  onRedactColorChange(hex) {
+    update({ redactColor: hex });
+  },
+
+  async onConfirmRedaction(pageIndex, rect) {
+    await withBusy('Redacting…', async () => {
+      await engine.applyRedaction(pageIndex, rect, state.redactColor);
+      update({ redactDraft: null });
+      await refreshAll(pageIndex);
+    });
+  },
+
+  // --- Image editing ------------------------------------------------------
+
+  onSelectImage(pageIndex, rect) {
+    update({ selectedImage: pageIndex !== null ? { pageIndex, rect } : null, cropDraft: null });
+  },
+
+  onReplaceImageClick(pageIndex, rect) {
+    pendingImageReplace = { pageIndex, rect };
+    els.imageInput.click();
+  },
+
+  async onDeleteImage(pageIndex, rect) {
+    if (!window.confirm('Permanently delete this image?')) return;
+    await withBusy('Deleting image…', async () => {
+      await engine.deleteImage(pageIndex, rect);
+      update({ selectedImage: null });
+      await refreshAll(pageIndex);
+    });
+  },
+
+  onStartCrop(pageIndex, rect) {
+    update({ cropDraft: { pageIndex, originalRect: rect } });
+  },
+
+  onCropDrawn(pageIndex, rect) {
+    if (!state.cropDraft) return;
+    update({ cropDraft: { ...state.cropDraft, keepRect: rect } });
+  },
+
+  onCancelCrop() {
+    update({ cropDraft: null });
+  },
+
+  async onConfirmCrop(pageIndex, originalRect, keepRect) {
+    await withBusy('Cropping…', async () => {
+      await engine.cropImage(pageIndex, originalRect, keepRect);
+      update({ cropDraft: null, selectedImage: null });
+      await refreshAll(pageIndex);
+    });
+  },
+
+  // --- Undo / redo ------------------------------------------------------
+
+  async onUndo() {
+    await withBusy('Undoing…', async () => {
+      const ok = await engine.undo();
+      if (!ok) return;
+      resetToolOverlays();
+      await refreshAll(state.selectedPageIndex);
+    });
+  },
+
+  async onRedo() {
+    await withBusy('Redoing…', async () => {
+      const ok = await engine.redo();
+      if (!ok) return;
+      resetToolOverlays();
+      await refreshAll(state.selectedPageIndex);
+    });
+  },
+
+  // --- Save / Close -------------------------------------------------------
+
+  async onSave() {
+    if (!state.isLoaded) return;
+    await withBusy('Saving…', async () => {
+      const bytes = await engine.getBytes();
+      let saved = false;
+
+      if (fileHandle) {
+        try {
+          await writeToHandle(fileHandle, bytes);
+          saved = true;
+        } catch {
+          // Handle may have lost permission or its file may have moved — fall back to Save As.
+          const handle = await pickPdfSaveLocation(state.fileName || 'document.pdf', bytes);
+          if (handle && !handle.cancelled) { fileHandle = handle; saved = true; }
+          else if (!handle) { downloadBytes(bytes, state.fileName || 'document.pdf'); saved = true; }
+        }
+      } else if (supportsFileSystemAccess()) {
+        const handle = await pickPdfSaveLocation(state.fileName || 'document.pdf', bytes);
+        if (handle && !handle.cancelled) { fileHandle = handle; saved = true; }
+        else if (!handle) { downloadBytes(bytes, state.fileName || 'document.pdf'); saved = true; }
+      } else {
+        downloadBytes(bytes, state.fileName || 'document.pdf');
+        saved = true;
+      }
+
+      // A cancelled Save As dialog leaves nothing actually written — don't
+      // clear the dirty flag for a save that didn't happen.
+      if (saved) {
+        engine.markSaved();
+        update({ isDirty: engine.isDirty() });
+      }
+    });
+  },
+
+  async onCloseDocument() {
+    if (!state.isLoaded) return;
+    if (!confirmDiscardIfDirty('You have unsaved changes. Close this document and discard them?')) return;
+    fileHandle = null;
+    engine.close();
+    update({
+      pageCount: 0,
+      pages: [],
+      selectedPageIndex: null,
+      isLoaded: false,
+      fileName: null,
+      docRevision: state.docRevision + 1,
+      activeTool: 'select',
+      isDirty: false,
+      canUndo: false,
+      canRedo: false,
+      textEdit: null,
+      redactDraft: null,
+      selectedImage: null,
+      cropDraft: null,
+    });
+  },
 };
 
 function render() {
@@ -210,10 +421,58 @@ els.fileInput.addEventListener('change', () => {
   els.fileInput.value = '';
 });
 
+// Dedicated single-file input for the toolbar's "Open" action (browsers
+// without the File System Access API) — always replaces the current
+// document, unlike the drag-and-drop/empty-state input above which merges
+// into an already-open one.
+els.openFileInput.addEventListener('change', async () => {
+  const file = els.openFileInput.files[0];
+  els.openFileInput.value = '';
+  if (!file) return;
+  await withBusy('Loading…', async () => {
+    await engine.loadFromBytes(new Uint8Array(await file.arrayBuffer()), file.name);
+    update({ activeTool: 'select' });
+    resetToolOverlays();
+    await refreshAll(0);
+  });
+});
+
+els.imageInput.addEventListener('change', async () => {
+  const file = els.imageInput.files[0];
+  const target = pendingImageReplace;
+  pendingImageReplace = null;
+  els.imageInput.value = '';
+  if (!file || !target) return;
+  const mimeType = file.type === 'image/jpeg' ? 'image/jpeg' : 'image/png';
+  await withBusy('Replacing image…', async () => {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await engine.replaceImage(target.pageIndex, target.rect, bytes, mimeType);
+    update({ selectedImage: null });
+    await refreshAll(target.pageIndex);
+  });
+});
+
 els.canvasArea.addEventListener('dragover', (e) => e.preventDefault());
 els.canvasArea.addEventListener('drop', (e) => {
   e.preventDefault();
   if (e.dataTransfer.files.length) openOrMergeFiles(e.dataTransfer.files);
+});
+
+window.addEventListener('keydown', (e) => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod) return;
+  if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return; // let the field handle its own undo/select-all
+  const key = e.key.toLowerCase();
+  if (key === 'z' && !e.shiftKey) { e.preventDefault(); actions.onUndo(); }
+  else if (key === 'y' || (key === 'z' && e.shiftKey)) { e.preventDefault(); actions.onRedo(); }
+  else if (key === 's') { e.preventDefault(); actions.onSave(); }
+  else if (key === 'o') { e.preventDefault(); actions.onOpenFileClick(); }
+});
+
+window.addEventListener('beforeunload', (e) => {
+  if (!state.isDirty) return;
+  e.preventDefault();
+  e.returnValue = '';
 });
 
 if ('serviceWorker' in navigator) {

@@ -568,7 +568,18 @@ button { font-family: inherit; }
 .style-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .style-btn svg { stroke: var(--ink-soft); }
 
+.style-btn.active { background: var(--accent); border-color: var(--accent); }
+.style-btn.active span { color: #FFFFFF; }
+
 .style-row .fill { flex-grow: 1; }
+
+input.swatch {
+  -webkit-appearance: none;
+  appearance: none;
+}
+input.swatch::-webkit-color-swatch-wrapper { padding: 3px; }
+input.swatch::-webkit-color-swatch { border: none; border-radius: 5px; }
+input.swatch::-moz-color-swatch { border: none; border-radius: 5px; }
 
 .section-divider {
   height: 1px;
