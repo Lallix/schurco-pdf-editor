@@ -1,0 +1,14 @@
+{
+  "name": "Schurco PDF Editor",
+  "short_name": "PDF Editor",
+  "description": "Browser-based PDF editor for Schurco Slurry staff — page management, redaction, and editing tools, entirely client-side.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#EDEEEC",
+  "theme_color": "#15181A",
+  "orientation": "landscape",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
