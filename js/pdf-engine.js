@@ -10,6 +10,25 @@ import Tesseract from './vendor/tesseract/tesseract.esm.min.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './js/vendor/pdf.worker.min.mjs';
 
+// pdf.js needs these for anything beyond the simplest PDFs: wasmUrl for its
+// WASM image decoders (JBIG2, OpenJPEG/JPX, qcms colour management —
+// without it, e.g. a JBIG2-masked scanned image silently fails to decode
+// and renders washed out instead of throwing), cMapUrl for CJK/non-Latin
+// embedded fonts, and standardFontDataUrl for text using a standard font
+// that isn't embedded in the file. None of these have a default — pdf.js
+// throws (or, worse, quietly degrades) unless every one is provided.
+// pdf.js validates these as real http(s) URLs (see isValidFetchUrl in its
+// source) — a plain relative string like './js/vendor/...' fails that check
+// silently and falls back to a broken code path, so these must be resolved
+// to absolute URLs against the page's own location first.
+const abs = (path) => new URL(path, window.location.href).href;
+const PDFJS_DOC_OPTIONS = {
+  wasmUrl: abs('./js/vendor/pdfjs-data/wasm/'),
+  cMapUrl: abs('./js/vendor/pdfjs-data/cmaps/'),
+  cMapPacked: true,
+  standardFontDataUrl: abs('./js/vendor/pdfjs-data/standard_fonts/'),
+};
+
 // All three vendored locally (runtime, WASM core, English trained data) —
 // no network call is ever made for OCR. corePath points at one specific
 // prebuilt core (SIMD+LSTM) rather than a directory of every variant, which
@@ -225,7 +244,7 @@ class PdfEngine {
 
   async _refreshRenderDoc() {
     const bytes = await this.doc.save();
-    this.renderDoc = await pdfjsLib.getDocument({ data: bytes }).promise;
+    this.renderDoc = await pdfjsLib.getDocument({ data: bytes, ...PDFJS_DOC_OPTIONS }).promise;
   }
 
   getPageCount() {
@@ -386,7 +405,7 @@ class PdfEngine {
   // Loads a pdf.js render doc for an external file's bytes (e.g. for the
   // "insert pages from another PDF" picker), independent of the working doc.
   async loadExternalRenderDoc(bytes) {
-    return pdfjsLib.getDocument({ data: bytes }).promise;
+    return pdfjsLib.getDocument({ data: bytes, ...PDFJS_DOC_OPTIONS }).promise;
   }
 
   // --- Text editing (redact-and-replace) -----------------------------------

@@ -1,4 +1,4 @@
-const CACHE = 'schurco-pdf-editor-v5';
+const CACHE = 'schurco-pdf-editor-v6';
 const ASSETS = [
   './',
   './index.html',
@@ -19,6 +19,13 @@ const ASSETS = [
   './js/vendor/pdf-lib.esm.min.js',
   './js/vendor/docx.esm.js',
   './js/vendor/xlsx.esm.mjs',
+  // WASM image/colour decoders — required for pdf.js to correctly render
+  // some scanned PDFs (e.g. a JBIG2-masked image renders washed-out
+  // without jbig2.wasm), so these are precached rather than left to
+  // runtime caching below.
+  './js/vendor/pdfjs-data/wasm/jbig2.wasm',
+  './js/vendor/pdfjs-data/wasm/openjpeg.wasm',
+  './js/vendor/pdfjs-data/wasm/qcms_bg.wasm',
   './js/vendor/tesseract/tesseract.esm.min.js',
   './js/vendor/tesseract/worker.min.js',
   './js/vendor/tesseract/tesseract-core-simd-lstm.wasm.js',
@@ -26,6 +33,13 @@ const ASSETS = [
   './icons/icon-192.png',
   './icons/icon-512.png'
 ];
+
+// pdf.js's character maps (cmaps/) and non-embedded standard fonts
+// (standard_fonts/) are ~190 small files fetched only for the specific
+// glyphs a given PDF actually needs — not worth precaching all of, but
+// still cached the first time each is used so offline viewing of a
+// previously-opened PDF keeps working.
+const RUNTIME_CACHE_PREFIX = './js/vendor/pdfjs-data/';
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));
@@ -49,7 +63,13 @@ self.addEventListener('fetch', e => {
   e.respondWith(
     caches.match(e.request).then(cached => {
       if (cached) return cached;
-      return fetch(e.request).catch(() => {
+      return fetch(e.request).then(response => {
+        if (response.ok && url.pathname.includes(RUNTIME_CACHE_PREFIX.slice(1))) {
+          const copy = response.clone();
+          caches.open(CACHE).then(c => c.put(e.request, copy));
+        }
+        return response;
+      }).catch(() => {
         if (e.request.mode === 'navigate') return caches.match('./index.html');
       });
     })
