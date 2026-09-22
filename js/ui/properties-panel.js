@@ -152,8 +152,8 @@ function renderPagePanel(container, state, actions) {
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5V6a2 2 0 0 1 2-2h2.5M20 8.5V6a2 2 0 0 0-2-2h-2.5M4 15.5V18a2 2 0 0 0 2 2h2.5M20 15.5V18a2 2 0 0 1-2 2h-2.5"/><path d="M4 12h16"/></svg>
           <span>Page ${idx + 1} appears scanned</span>
         </div>
-        <p>Run OCR to make its text searchable, selectable and editable.</p>
-        <button class="ocr-run-btn" disabled title="Coming in a later phase">Run OCR</button>
+        <p>Run OCR to make its text searchable, selectable and copyable.</p>
+        <button class="ocr-run-btn" data-role="run-ocr">Run OCR</button>
       </div>
     ` : ''}
   `;
@@ -164,4 +164,5 @@ function renderPagePanel(container, state, actions) {
   container.querySelector('[data-role="rotate-left"]').addEventListener('click', () => actions.onRotatePage(idx, -90));
   container.querySelector('[data-role="rotate-right"]').addEventListener('click', () => actions.onRotatePage(idx, 90));
   container.querySelector('[data-role="delete"]').addEventListener('click', () => actions.onDeletePage(idx));
+  container.querySelector('[data-role="run-ocr"]')?.addEventListener('click', () => actions.onRunOcr(idx));
 }

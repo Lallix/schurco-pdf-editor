@@ -6,8 +6,21 @@
 import * as pdfjsLib from './vendor/pdf.min.mjs';
 import { OPS } from './vendor/pdf.min.mjs';
 import { PDFDocument, degrees, rgb, StandardFonts } from './vendor/pdf-lib.esm.min.js';
+import Tesseract from './vendor/tesseract/tesseract.esm.min.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './js/vendor/pdf.worker.min.mjs';
+
+// All three vendored locally (runtime, WASM core, English trained data) —
+// no network call is ever made for OCR. corePath points at one specific
+// prebuilt core (SIMD+LSTM) rather than a directory of every variant, which
+// is a deliberate size trade-off (~4MB instead of ~15MB): every browser this
+// app targets (current Chrome/Edge on staff Windows machines) supports WASM
+// SIMD, so the other combinations Tesseract.js could auto-pick never apply.
+const TESSERACT_PATHS = {
+  workerPath: './js/vendor/tesseract/worker.min.js',
+  corePath: './js/vendor/tesseract/tesseract-core-simd-lstm.wasm.js',
+  langPath: './js/vendor/tesseract/lang-data',
+};
 
 const PAGE_SIZES = {
   A4: [595.28, 841.89],
@@ -17,6 +30,10 @@ const PAGE_SIZES = {
 // Page resolution used when a dirty page is rasterized for export — about
 // 180 DPI (72 * 2.5), sharp enough for on-screen and print.
 const FLATTEN_SCALE = 2.5;
+
+// Page resolution fed to Tesseract for OCR — higher than the flatten scale
+// since recognition accuracy benefits from more pixels per glyph.
+const OCR_SCALE = 3;
 
 const FONT_VARIANTS = {
   Helvetica: [StandardFonts.Helvetica, StandardFonts.HelveticaBold, StandardFonts.HelveticaOblique, StandardFonts.HelveticaBoldOblique],
@@ -37,6 +54,20 @@ function hexToRgb01(hex) {
 
 function pointInRect(px, py, r) {
   return px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height;
+}
+
+// Tesseract's `blocks` output nests words under block -> paragraph -> line
+// -> word; there's no flat `data.words` on the result.
+function flattenOcrWords(data) {
+  const words = [];
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs || []) {
+      for (const line of para.lines || []) {
+        for (const word of line.words || []) words.push(word);
+      }
+    }
+  }
+  return words;
 }
 
 // Composes a `cm` operand (applied first) with the current CTM — standard
@@ -569,6 +600,62 @@ class PdfEngine {
     const bg = await this.sampleBackgroundColor(index, rect);
     page.drawRectangle({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, color: rgb(bg.r, bg.g, bg.b) });
     this._markDirty(index, rect);
+    await this._refreshRenderDoc();
+  }
+
+  // --- OCR -----------------------------------------------------------------
+
+  // Adds an invisible, positioned text layer over a scanned page so it
+  // becomes searchable/selectable/copyable without changing how it looks.
+  // Unlike text/image edits, this doesn't mark the page dirty for export —
+  // that mechanism exists to guarantee removal of covered content, which is
+  // the opposite of what OCR is doing (adding non-sensitive text), and
+  // flattening would rasterize away the very text layer just added.
+  async runOcr(index, onProgress) {
+    await this._snapshot();
+
+    const renderPage = await this.renderDoc.getPage(index + 1);
+    const viewport = renderPage.getViewport({ scale: OCR_SCALE });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await renderPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+
+    const worker = await Tesseract.createWorker('eng', Tesseract.OEM.LSTM_ONLY, {
+      ...TESSERACT_PATHS,
+      logger: (m) => {
+        if (onProgress && m.status === 'recognizing text') onProgress(m.progress);
+      },
+    });
+
+    let data;
+    try {
+      ({ data } = await worker.recognize(canvas, {}, { blocks: true }));
+    } finally {
+      await worker.terminate();
+    }
+
+    const docPage = this.doc.getPage(index);
+    const font = await this.doc.embedFont(StandardFonts.Helvetica);
+    for (const word of flattenOcrWords(data)) {
+      if (!word.text || !word.text.trim()) continue;
+      const { x0, y0, x1, y1 } = word.bbox;
+      const widthPt = (x1 - x0) / OCR_SCALE;
+      const heightPt = (y1 - y0) / OCR_SCALE;
+      if (widthPt <= 0 || heightPt <= 0) continue;
+      // Canvas is top-left-origin/y-down at OCR_SCALE; PDF space is
+      // bottom-left-origin/y-up at 1:1 — flip and undo the render scale.
+      const x = x0 / OCR_SCALE;
+      const y = (viewport.height - y1) / OCR_SCALE;
+      // Pick a font size so Helvetica's natural width roughly matches the
+      // word's actual pixel width — pdf-lib has no text-scale (Tz) option to
+      // fit it exactly, and an invisible layer only needs to be close enough
+      // for selection/search, not pixel-perfect.
+      const naturalWidthAt1pt = font.widthOfTextAtSize(word.text, 1) || 1;
+      const fontSize = Math.max(4, Math.min(widthPt / naturalWidthAt1pt, heightPt * 1.3));
+      docPage.drawText(word.text, { x, y, size: fontSize, font, opacity: 0 });
+    }
+
     await this._refreshRenderDoc();
   }
 }

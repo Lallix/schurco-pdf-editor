@@ -1,4 +1,4 @@
-const CACHE = 'schurco-pdf-editor-v3';
+const CACHE = 'schurco-pdf-editor-v4';
 const ASSETS = [
   './',
   './index.html',
@@ -16,6 +16,10 @@ const ASSETS = [
   './js/vendor/pdf.min.mjs',
   './js/vendor/pdf.worker.min.mjs',
   './js/vendor/pdf-lib.esm.min.js',
+  './js/vendor/tesseract/tesseract.esm.min.js',
+  './js/vendor/tesseract/worker.min.js',
+  './js/vendor/tesseract/tesseract-core-simd-lstm.wasm.js',
+  './js/vendor/tesseract/lang-data/eng.traineddata.gz',
   './icons/icon-192.png',
   './icons/icon-512.png'
 ];

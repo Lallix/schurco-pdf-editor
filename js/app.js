@@ -4,7 +4,7 @@ import { renderToolbar } from './ui/toolbar.js';
 import { renderSidebar } from './ui/sidebar.js';
 import { renderCanvas } from './ui/canvas.js';
 import { renderPropertiesPanel } from './ui/properties-panel.js';
-import { openInsertPageModal, openMergeModal } from './ui/modals.js';
+import { openInsertPageModal, openMergeModal, openOcrModal } from './ui/modals.js';
 import { supportsFileSystemAccess, pickPdfToOpen, pickPdfSaveLocation, writeToHandle } from './file-io.js';
 
 const els = {
@@ -99,6 +99,17 @@ async function openOrMergeFiles(fileList) {
   });
 }
 
+async function runOcrOnPages(indices, onProgress) {
+  await withBusy('Running OCR…', async () => {
+    for (let i = 0; i < indices.length; i++) {
+      const idx = indices[i];
+      update({ busyMessage: `Running OCR on page ${idx + 1} (${i + 1} of ${indices.length})…` });
+      await engine.runOcr(idx, (pct) => onProgress?.(idx, i + 1, indices.length, pct));
+    }
+    await refreshAll(state.selectedPageIndex);
+  });
+}
+
 const STICKY_TOOLS = ['select', 'text', 'redact', 'image'];
 
 const actions = {
@@ -143,7 +154,19 @@ const actions = {
       });
       return;
     }
-    // OCR is disabled until Phase 3 — no-op.
+    if (key === 'ocr') {
+      const scannedPages = state.pages
+        .map((p, i) => (p.likelyScanned ? i : null))
+        .filter((i) => i !== null);
+      if (!scannedPages.length) {
+        window.alert('No pages in this document appear to need OCR.');
+        return;
+      }
+      openOcrModal({
+        scannedPages,
+        onRun: (indices, onProgress) => runOcrOnPages(indices, onProgress),
+      });
+    }
   },
 
   onExport() {
@@ -224,6 +247,10 @@ const actions = {
       await engine.setPageSize(idx, sizeKey);
       await refreshAll(idx);
     });
+  },
+
+  onRunOcr(idx) {
+    return runOcrOnPages([idx]);
   },
 
   // --- Text editing ---------------------------------------------------

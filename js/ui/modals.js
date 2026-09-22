@@ -244,3 +244,65 @@ export function openMergeModal({ onDone }) {
     }
   });
 }
+
+// `scannedPages` is an array of page indices already detected as having no
+// text layer. `onRun(indices, onProgress)` does the actual OCR work.
+export function openOcrModal({ scannedPages, onRun }) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-label="Run OCR">
+      <h3>Run OCR</h3>
+      <span class="panel-empty">Makes the selected pages' text searchable, selectable, and copyable — the pages will look identical. Runs entirely in this browser; nothing is uploaded.</span>
+      <div data-role="page-list" style="display:flex;flex-direction:column;gap:8px;max-height:240px;overflow-y:auto;"></div>
+      <span data-role="progress" class="field-hint" style="display:none;"></span>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" data-role="cancel">Cancel</button>
+        <button type="button" class="btn-primary" data-role="run">Run OCR</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+
+  const listEl = backdrop.querySelector('[data-role="page-list"]');
+  const checked = new Set(scannedPages);
+  const runBtn = backdrop.querySelector('[data-role="run"]');
+  const cancelBtn = backdrop.querySelector('[data-role="cancel"]');
+  const progressEl = backdrop.querySelector('[data-role="progress"]');
+
+  scannedPages.forEach((idx) => {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink);cursor:pointer;';
+    row.innerHTML = `<input type="checkbox" checked data-idx="${idx}" /><span>Page ${idx + 1}</span>`;
+    listEl.appendChild(row);
+  });
+  listEl.addEventListener('change', (e) => {
+    const cb = e.target.closest('input[type="checkbox"]');
+    if (!cb) return;
+    const idx = Number(cb.dataset.idx);
+    if (cb.checked) checked.add(idx); else checked.delete(idx);
+    runBtn.disabled = checked.size === 0;
+  });
+
+  cancelBtn.addEventListener('click', () => closeModal(backdrop));
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(backdrop); });
+
+  runBtn.addEventListener('click', async () => {
+    runBtn.disabled = true;
+    cancelBtn.disabled = true;
+    listEl.querySelectorAll('input').forEach((cb) => { cb.disabled = true; });
+    progressEl.style.display = 'block';
+    const indices = Array.from(checked).sort((a, b) => a - b);
+    try {
+      await onRun(indices, (pageIdx, pageNum, total, pct) => {
+        progressEl.textContent = `Reading page ${pageIdx + 1} (${pageNum} of ${total}) — ${Math.round(pct * 100)}%`;
+      });
+      closeModal(backdrop);
+    } catch (err) {
+      progressEl.textContent = `OCR failed: ${err.message}`;
+      runBtn.disabled = false;
+      cancelBtn.disabled = false;
+      listEl.querySelectorAll('input').forEach((cb) => { cb.disabled = false; });
+    }
+  });
+}

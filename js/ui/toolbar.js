@@ -17,7 +17,7 @@ const TOOLS = [
   { key: 'insertPage', label: 'Insert page', enabled: true },
   { key: 'rotate', label: 'Rotate page', enabled: true },
   { key: 'merge', label: 'Merge documents', enabled: true },
-  { key: 'ocr', label: 'Run OCR', enabled: false },
+  { key: 'ocr', label: 'Run OCR', enabled: true },
 ];
 
 function icon(key, extra = '') {
