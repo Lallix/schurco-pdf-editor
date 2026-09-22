@@ -421,6 +421,43 @@ class PdfEngine {
     return runs;
   }
 
+  // Groups the page's text items into reading-order lines by clustering on
+  // baseline Y — a single visual line is often split into several pdf.js
+  // items by font/spacing changes. Used by the Word/Excel exporters, which
+  // need whole lines rather than individual runs.
+  async getTextLines(index) {
+    const page = await this.renderDoc.getPage(index + 1);
+    const { items } = await page.getTextContent();
+    const lines = [];
+    for (const item of items) {
+      if (!item.str || !item.str.trim()) continue;
+      const y = item.transform[5];
+      const fontSize = item.height || Math.hypot(item.transform[1], item.transform[3]) || 10;
+      let line = lines.find((l) => Math.abs(l.y - y) < Math.max(2, fontSize * 0.4));
+      if (!line) {
+        line = { y, fontSize, items: [] };
+        lines.push(line);
+      }
+      line.fontSize = Math.max(line.fontSize, fontSize);
+      line.items.push(item);
+    }
+    lines.sort((a, b) => b.y - a.y); // PDF y is bottom-up; descending = top to bottom
+    return lines
+      .map((line) => {
+        line.items.sort((a, b) => a.transform[4] - b.transform[4]);
+        let text = '';
+        let lastEndX = null;
+        for (const item of line.items) {
+          const x = item.transform[4];
+          if (lastEndX !== null && x - lastEndX > line.fontSize * 0.3) text += ' ';
+          text += item.str;
+          lastEndX = x + (item.width || 0);
+        }
+        return { text: text.trim(), y: line.y, x: line.items[0].transform[4], fontSize: line.fontSize };
+      })
+      .filter((l) => l.text);
+  }
+
   // Samples the current page's rendered appearance around `rect` to pick a
   // plausible cover colour (so a patch on a tinted report page blends in
   // instead of leaving a stark white/black box).
@@ -558,21 +595,19 @@ class PdfEngine {
     await this._refreshRenderDoc();
   }
 
-  // Keeps only the `keepRect` portion (PDF-space, within the original image's
-  // rect) by rasterizing the current page's pixels for that sub-region and
-  // re-embedding just that slice, then covering the rest of the original box.
-  async cropImage(index, originalRect, keepRect) {
-    await this._snapshot();
+  // Renders the page and crops out the pixels under `rect` (PDF-space) as a
+  // PNG — used both for cropping an image in place and for lifting an
+  // image's pixels out for the Word exporter (see export-formats.js).
+  async extractRegionPng(index, rect, scale = 3) {
     const page = await this.renderDoc.getPage(index + 1);
-    const scale = 3;
     const viewport = page.getViewport({ scale });
     const full = document.createElement('canvas');
     full.width = viewport.width;
     full.height = viewport.height;
     await page.render({ canvasContext: full.getContext('2d'), viewport }).promise;
 
-    const p1 = viewport.convertToViewportPoint(keepRect.x, keepRect.y);
-    const p2 = viewport.convertToViewportPoint(keepRect.x + keepRect.width, keepRect.y + keepRect.height);
+    const p1 = viewport.convertToViewportPoint(rect.x, rect.y);
+    const p2 = viewport.convertToViewportPoint(rect.x + rect.width, rect.y + rect.height);
     const left = Math.max(0, Math.round(Math.min(p1[0], p2[0])));
     const top = Math.max(0, Math.round(Math.min(p1[1], p2[1])));
     const w = Math.max(1, Math.round(Math.abs(p2[0] - p1[0])));
@@ -583,7 +618,15 @@ class PdfEngine {
     cropped.height = h;
     cropped.getContext('2d').drawImage(full, left, top, w, h, 0, 0, w, h);
     const blob = await new Promise((resolve) => cropped.toBlob(resolve, 'image/png'));
-    const pngBytes = new Uint8Array(await blob.arrayBuffer());
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+
+  // Keeps only the `keepRect` portion (PDF-space, within the original image's
+  // rect) by rasterizing the current page's pixels for that sub-region and
+  // re-embedding just that slice, then covering the rest of the original box.
+  async cropImage(index, originalRect, keepRect) {
+    await this._snapshot();
+    const pngBytes = await this.extractRegionPng(index, keepRect);
 
     const docPage = this.doc.getPage(index);
     const bg = await this.sampleBackgroundColor(index, originalRect);

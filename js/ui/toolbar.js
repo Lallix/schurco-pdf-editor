@@ -29,6 +29,7 @@ function fileOpIcon(path) {
 }
 
 let lastSignature = null;
+let outsideClickWired = false;
 
 export function renderToolbar(container, state, actions) {
   const signature = JSON.stringify([
@@ -86,20 +87,44 @@ export function renderToolbar(container, state, actions) {
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 1 1 8 0v3"/></svg>
       <span>Local only — nothing uploaded</span>
     </div>
-    <button class="export-btn" data-role="export" ${state.isLoaded ? '' : 'disabled'} aria-label="Export document">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>
-      <span>Export</span>
-    </button>
+    <div class="export-menu-wrap" style="position:relative;">
+      <button class="export-btn" data-role="export-toggle" ${state.isLoaded ? '' : 'disabled'} aria-label="Export document" aria-haspopup="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M8 11l4 4 4-4"/><path d="M5 19h14"/></svg>
+        <span>Export</span>
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div class="export-menu" data-role="export-menu" style="display:none;position:absolute;top:44px;right:0;background:var(--surface);border-radius:8px;box-shadow:0 12px 28px rgba(20,22,20,0.22);min-width:200px;overflow:hidden;z-index:30;padding:6px;">
+        <button class="export-menu-item" data-role="export-pdf">Export as PDF</button>
+        <button class="export-menu-item" data-role="export-word">Export as Word (.docx)</button>
+        <button class="export-menu-item" data-role="export-excel">Export as Excel (.xlsx)</button>
+      </div>
+    </div>
     <div class="avatar"><span>${(window.SCHURCO_USER_INITIALS || 'GV')}</span></div>
   `;
 
   container.querySelectorAll('[data-tool]').forEach((btn) => {
     btn.addEventListener('click', () => actions.onToolClick(btn.dataset.tool));
   });
-  container.querySelector('[data-role="export"]').addEventListener('click', () => actions.onExport());
   container.querySelector('[data-role="open"]').addEventListener('click', () => actions.onOpenFileClick());
   container.querySelector('[data-role="save"]').addEventListener('click', () => actions.onSave());
   container.querySelector('[data-role="close"]').addEventListener('click', () => actions.onCloseDocument());
   container.querySelector('[data-role="undo"]').addEventListener('click', () => actions.onUndo());
   container.querySelector('[data-role="redo"]').addEventListener('click', () => actions.onRedo());
+
+  const menu = container.querySelector('[data-role="export-menu"]');
+  const toggle = container.querySelector('[data-role="export-toggle"]');
+  toggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+  });
+  if (!outsideClickWired) {
+    outsideClickWired = true;
+    document.addEventListener('click', () => {
+      const openMenu = document.querySelector('[data-role="export-menu"]');
+      if (openMenu) openMenu.style.display = 'none';
+    });
+  }
+  container.querySelector('[data-role="export-pdf"]').addEventListener('click', () => { menu.style.display = 'none'; actions.onExport(); });
+  container.querySelector('[data-role="export-word"]').addEventListener('click', () => { menu.style.display = 'none'; actions.onExportWord(); });
+  container.querySelector('[data-role="export-excel"]').addEventListener('click', () => { menu.style.display = 'none'; actions.onExportExcel(); });
 }

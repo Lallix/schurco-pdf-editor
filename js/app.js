@@ -6,6 +6,7 @@ import { renderCanvas } from './ui/canvas.js';
 import { renderPropertiesPanel } from './ui/properties-panel.js';
 import { openInsertPageModal, openMergeModal, openOcrModal } from './ui/modals.js';
 import { supportsFileSystemAccess, pickPdfToOpen, pickPdfSaveLocation, writeToHandle } from './file-io.js';
+import { buildDocxBlob, buildXlsxBlob } from './export-formats.js';
 
 const els = {
   toolbar: document.getElementById('toolbar'),
@@ -35,7 +36,10 @@ function clamp(n, min, max) {
 }
 
 function downloadBytes(bytes, filename) {
-  const blob = new Blob([bytes], { type: 'application/pdf' });
+  downloadBlob(new Blob([bytes], { type: 'application/pdf' }), filename);
+}
+
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -179,6 +183,26 @@ const actions = {
     engine.exportPages([idx]).then((bytes) => {
       const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
       downloadBytes(bytes, `${base}-page-${idx + 1}.pdf`);
+    });
+  },
+
+  async onExportWord() {
+    if (!state.isLoaded) return;
+    await withBusy('Converting to Word…', async () => {
+      const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
+      const indices = Array.from({ length: state.pageCount }, (_, i) => i);
+      const blob = await buildDocxBlob(engine, indices);
+      downloadBlob(blob, `${base}.docx`);
+    });
+  },
+
+  async onExportExcel() {
+    if (!state.isLoaded) return;
+    await withBusy('Converting to Excel…', async () => {
+      const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
+      const indices = Array.from({ length: state.pageCount }, (_, i) => i);
+      const blob = await buildXlsxBlob(engine, indices);
+      downloadBlob(blob, `${base}.xlsx`);
     });
   },
 
