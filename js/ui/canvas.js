@@ -3,6 +3,15 @@ import { engine } from '../pdf-engine.js';
 const BASE_WIDTH_AT_100 = 600;
 
 let lastSignature = null;
+// Bumped on every renderCanvas call; a call checks this after each await and
+// bails if a newer one has since started. Without this, two overlapping
+// renders (e.g. opening a file and immediately clicking a tool) can race:
+// the older call's container.innerHTML already got replaced by the newer
+// one, but it doesn't know that, so it goes on to wire click/drag listeners
+// onto its own now-detached, invisible canvas — leaving the actual visible
+// one never wired up. That's exactly what "the tool looks selected but
+// nothing happens" looks like from the outside.
+let renderGeneration = 0;
 
 // The text the user is actively typing during a text edit. Kept outside
 // global state so keystrokes never trigger a re-render (which would rebuild
@@ -10,13 +19,6 @@ let lastSignature = null;
 // properties panel do that, and those are infrequent discrete clicks.
 let draftText = null;
 let lastTextEditKey = null;
-
-function pdfPointFromClient(canvasEl, viewport, clientX, clientY) {
-  const rect = canvasEl.getBoundingClientRect();
-  const x = (clientX - rect.left) * (canvasEl.width / rect.width);
-  const y = (clientY - rect.top) * (canvasEl.height / rect.height);
-  return viewport.convertToPdfPoint(x, y);
-}
 
 function pdfRectToScreen(viewport, rect) {
   const p1 = viewport.convertToViewportPoint(rect.x, rect.y);
@@ -43,9 +45,14 @@ export async function renderCanvas(container, state, actions) {
     state.textEdit ? { r: state.textEdit.rect, s: state.textEdit.fontFamily, sz: state.textEdit.fontSize, c: state.textEdit.color, b: state.textEdit.bold, i: state.textEdit.italic, u: state.textEdit.underline } : null,
     state.redactDraft, state.selectedImage, state.cropDraft,
   ]);
-  if (signature === lastSignature && container.dataset.rendered === '1') return;
+  if (signature === lastSignature && container.dataset.rendered === '1') {
+    window.__renderCanvasSkipped = (window.__renderCanvasSkipped || 0) + 1;
+    return;
+  }
   lastSignature = signature;
   container.dataset.rendered = '1';
+  const myGeneration = ++renderGeneration;
+  window.__renderCanvasProceeded = (window.__renderCanvasProceeded || 0) + 1;
 
   const textEditKey = state.textEdit ? `${state.textEdit.pageIndex}:${state.textEdit.rect.x}:${state.textEdit.rect.y}` : null;
   const isNewTextEdit = textEditKey !== lastTextEditKey;
@@ -103,28 +110,42 @@ export async function renderCanvas(container, state, actions) {
   const canvas = container.querySelector('.page-sheet');
   const overlays = container.querySelector('.page-overlays');
 
-  const { viewport } = await engine.renderPageToCanvas(idx, canvas, targetWidth);
+  // Viewport geometry is cheap (no canvas compositing) — get it and wire up
+  // interactions immediately so the tool is usable right away, rather than
+  // waiting on the much slower page.render() below to paint pixels first.
+  // Without this split, a slow render left the canvas with no listeners at
+  // all for however long painting took — the tool would look selected but
+  // silently do nothing if you moved fast (or the page was complex/slow).
+  const viewport = await engine.getPageViewport(idx, targetWidth);
+  if (myGeneration !== renderGeneration) return; // a newer render has since taken over this container
+
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+
+  const textRuns = (state.activeTool === 'text' && !state.textEdit) ? await engine.getTextRuns(idx) : null;
+  if (myGeneration !== renderGeneration) return;
 
   wireToolInteractions(canvas, overlays, idx, viewport, state, actions);
-  renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit);
+  renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns);
+
+  engine.renderPageToCanvas(idx, canvas, targetWidth).catch(() => {});
 }
 
 function wireToolInteractions(canvas, overlays, idx, viewport, state, actions) {
   canvas.style.cursor = state.activeTool === 'select' ? 'default' : 'crosshair';
 
-  canvas.addEventListener('click', async (e) => {
-    if (state.activeTool === 'text') {
-      const [px, py] = pdfPointFromClient(canvas, viewport, e.clientX, e.clientY);
-      const runs = await engine.getTextRuns(idx);
-      const hit = runs.find((r) => px >= r.rect.x && px <= r.rect.x + r.rect.width && py >= r.rect.y && py <= r.rect.y + r.rect.height);
-      if (hit) actions.onStartTextEdit(idx, hit);
-    } else if (state.activeTool === 'image' && !state.cropDraft) {
-      const [px, py] = pdfPointFromClient(canvas, viewport, e.clientX, e.clientY);
+  if (state.activeTool === 'image') {
+    canvas.addEventListener('click', async (e) => {
+      if (state.cropDraft) return;
+      const rectC = canvas.getBoundingClientRect();
+      const x = (e.clientX - rectC.left) * (canvas.width / rectC.width);
+      const y = (e.clientY - rectC.top) * (canvas.height / rectC.height);
+      const [px, py] = viewport.convertToPdfPoint(x, y);
       const rects = await engine.getImageRects(idx);
       const hit = rects.find((r) => px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height);
       actions.onSelectImage(hit ? idx : null, hit || null);
-    }
-  });
+    });
+  }
 
   if (state.activeTool === 'redact' || (state.activeTool === 'image' && state.cropDraft)) {
     let dragBox = null;
@@ -177,10 +198,35 @@ function wireToolInteractions(canvas, overlays, idx, viewport, state, actions) {
   }
 }
 
-function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit) {
+function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns) {
   overlays.innerHTML = '';
 
+  // --- Edit Text: dim the page and highlight only the editable runs, so it's
+  // obvious what can be clicked instead of hunting for it with a crosshair.
+  if (textRuns && state.activeTool === 'text') {
+    const scrim = document.createElement('div');
+    scrim.style.cssText = 'position:absolute;inset:0;background:rgba(21,24,26,0.45);pointer-events:none;';
+    overlays.appendChild(scrim);
+
+    for (const run of textRuns) {
+      const screen = pdfRectToScreen(viewport, run.rect);
+      const pad = 3;
+      const box = document.createElement('button');
+      box.type = 'button';
+      box.setAttribute('aria-label', `Edit text: ${run.text}`);
+      box.style.cssText = `position:absolute;left:${screen.left - pad}px;top:${screen.top - pad}px;width:${screen.width + pad * 2}px;height:${screen.height + pad * 2}px;background:rgba(255,255,255,0.96);border:1.5px solid var(--accent);border-radius:3px;padding:0;cursor:pointer;pointer-events:auto;`;
+      box.addEventListener('click', () => actions.onStartTextEdit(idx, run));
+      overlays.appendChild(box);
+    }
+  }
+
   if (state.textEdit && state.textEdit.pageIndex === idx) {
+    // Keep the page dimmed behind the single active edit too, for visual
+    // consistency with the browsing view above.
+    const scrim = document.createElement('div');
+    scrim.style.cssText = 'position:absolute;inset:0;background:rgba(21,24,26,0.45);pointer-events:none;';
+    overlays.appendChild(scrim);
+
     const te = state.textEdit;
     if (isNewTextEdit || draftText === null) draftText = te.text;
     const screen = pdfRectToScreen(viewport, te.rect);
@@ -198,7 +244,9 @@ function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit) 
     input.addEventListener('input', () => { draftText = input.value; });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+      // Escape is handled globally (see app.js) to fully exit the Edit Text
+      // tool — just prevent any native input behaviour here and let it bubble.
+      if (e.key === 'Escape') { e.preventDefault(); }
     });
     box.appendChild(input);
 
@@ -215,7 +263,7 @@ function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit) 
     function commit() {
       const text = draftText;
       draftText = null;
-      actions.onCommitTextEdit(te.pageIndex, te.rect, text, {
+      actions.onCommitTextEdit(te.pageIndex, te.rect, te.text, text, {
         fontFamily: te.fontFamily, fontSize: te.fontSize, color: te.color, bold: te.bold, italic: te.italic, underline: te.underline,
       });
     }

@@ -304,9 +304,9 @@ const actions = {
     update({ textEdit: null });
   },
 
-  async onCommitTextEdit(pageIndex, rect, text, style) {
+  async onCommitTextEdit(pageIndex, rect, originalText, text, style) {
     await withBusy('Applying edit…', async () => {
-      await engine.commitTextEdit(pageIndex, rect, text, style);
+      await engine.commitTextEdit(pageIndex, rect, originalText, text, style);
       update({ textEdit: null });
       await refreshAll(pageIndex);
     });
@@ -510,6 +510,16 @@ els.canvasArea.addEventListener('drop', (e) => {
 });
 
 window.addEventListener('keydown', (e) => {
+  // Escape always backs all the way out of whichever tool is active (Edit
+  // Text, Redact, Edit Image) — works whether you're mid-edit (an input may
+  // have already handled/bubbled the key) or just browsing, e.g. the Edit
+  // Text tool's highlighted-runs view with nothing selected yet.
+  if (e.key === 'Escape' && state.activeTool !== 'select') {
+    e.preventDefault();
+    actions.onToolClick('select');
+    return;
+  }
+
   const mod = e.ctrlKey || e.metaKey;
   if (!mod) return;
   if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return; // let the field handle its own undo/select-all

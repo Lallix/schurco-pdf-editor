@@ -236,10 +236,15 @@ class PdfEngine {
     this.coveredRegions = newCovered;
   }
 
-  _markDirty(index, rect) {
+  // `originalText`, when set, means this covered region should only exclude
+  // hit-testing for text matching that exact original string — so a freshly
+  // *replaced* run (different text, same spot) stays clickable and can be
+  // re-edited again, while the stale original can't resurface. Redaction and
+  // image edits omit it, since those regions should stay excluded outright.
+  _markDirty(index, rect, originalText) {
     this.dirtyPages.add(index);
     if (!this.coveredRegions.has(index)) this.coveredRegions.set(index, []);
-    if (rect) this.coveredRegions.get(index).push(rect);
+    if (rect) this.coveredRegions.get(index).push({ ...rect, originalText });
   }
 
   async _refreshRenderDoc() {
@@ -282,6 +287,16 @@ class PdfEngine {
 
   async renderPageToCanvas(index, canvas, targetWidth) {
     return renderPageOfDoc(this.renderDoc, index, canvas, targetWidth);
+  }
+
+  // Computes the viewport without painting anything — cheap (no canvas
+  // compositing), so UI code can wire up click/drag interactions and know
+  // page geometry immediately, instead of waiting on the much slower
+  // page.render() call to paint pixels before the page becomes interactive.
+  async getPageViewport(index, targetWidth) {
+    const page = await this.renderDoc.getPage(index + 1);
+    const baseViewport = page.getViewport({ scale: 1 });
+    return page.getViewport({ scale: targetWidth / baseViewport.width });
   }
 
   async rotatePage(index, deltaDegrees) {
@@ -426,7 +441,12 @@ class PdfEngine {
       const height = item.height || Math.hypot(b, d) || 10;
       const width = item.width || 1;
       const rect = { x: e, y: f - height * 0.25, width, height: height * 1.15 };
-      if (covered.some((r) => pointInRect(e + width / 2, f, r))) continue;
+      const cx = e + width / 2;
+      const isCovered = covered.some((r) => {
+        if (!pointInRect(cx, f, r)) return false;
+        return r.originalText === undefined || r.originalText === item.str;
+      });
+      if (isCovered) continue;
       const style = (styles && styles[item.fontName]) || {};
       const family = (style.fontFamily || '').toLowerCase();
       runs.push({
@@ -510,7 +530,7 @@ class PdfEngine {
   // Covers the original run's box and draws the new text in its place, then
   // marks the page dirty so export rasterizes it and the original glyphs are
   // guaranteed gone from the file (see _buildExportDoc).
-  async commitTextEdit(index, originalRect, text, style) {
+  async commitTextEdit(index, originalRect, originalText, text, style) {
     await this._snapshot();
     const page = this.doc.getPage(index);
     const bg = await this.sampleBackgroundColor(index, originalRect);
@@ -541,7 +561,7 @@ class PdfEngine {
         });
       }
     }
-    this._markDirty(index, originalRect);
+    this._markDirty(index, originalRect, originalText);
     await this._refreshRenderDoc();
   }
 
