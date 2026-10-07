@@ -76,17 +76,18 @@ function pointInRect(px, py, r) {
 }
 
 // Tesseract's `blocks` output nests words under block -> paragraph -> line
-// -> word; there's no flat `data.words` on the result.
-function flattenOcrWords(data) {
-  const words = [];
+// -> word; there's no flat `data.words` on the result. Lines are kept (with
+// their baseline) because placing every word on its line's shared baseline
+// gives far cleaner text than each word's own bounding-box bottom, which
+// wanders with descenders (g, y, p) and makes one line look like several.
+function flattenOcrLines(data) {
+  const lines = [];
   for (const block of data.blocks || []) {
     for (const para of block.paragraphs || []) {
-      for (const line of para.lines || []) {
-        for (const word of line.words || []) words.push(word);
-      }
+      for (const line of para.lines || []) lines.push(line);
     }
   }
-  return words;
+  return lines;
 }
 
 // Composes a `cm` operand (applied first) with the current CTM — standard
@@ -107,6 +108,27 @@ function composeMatrix(m, cur) {
 
 function applyMatrix([a, b, c, d, e, f], x, y) {
   return [a * x + c * y + e, b * x + d * y + f];
+}
+
+// Most common colour among the pixels `include(x, y)` selects, bucketed to 5
+// bits per channel so antialiasing noise doesn't split a flat colour, then
+// averaged within the winning bucket for the exact shade.
+function dominantColor(data, w, h, include) {
+  const buckets = new Map();
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!include(x, y)) continue;
+      const i = (y * w + x) * 4;
+      const key = ((data[i] >> 3) << 10) | ((data[i + 1] >> 3) << 5) | (data[i + 2] >> 3);
+      const b = buckets.get(key);
+      if (b) { b.n++; b.r += data[i]; b.g += data[i + 1]; b.b += data[i + 2]; }
+      else buckets.set(key, { n: 1, r: data[i], g: data[i + 1], b: data[i + 2] });
+    }
+  }
+  let best = null;
+  for (const b of buckets.values()) if (!best || b.n > best.n) best = b;
+  if (!best) return null;
+  return { r: best.r / best.n / 255, g: best.g / best.n / 255, b: best.b / best.n / 255 };
 }
 
 function ptToMm(pt) {
@@ -138,6 +160,8 @@ class PdfEngine {
     // PDF-space rects already covered by an edit, per page index — excluded
     // from future hit-testing so a replaced/redacted run can't be re-clicked.
     this.coveredRegions = new Map();
+    // Pages OCR has been run on — so they stop being flagged as "scanned".
+    this.ocrPages = new Set();
     this.undoStack = [];
     this.redoStack = [];
     this.dirty = false;
@@ -150,6 +174,7 @@ class PdfEngine {
     this.fileName = fileName;
     this.dirtyPages = new Set();
     this.coveredRegions = new Map();
+    this.ocrPages = new Set();
     this.undoStack = [];
     this.redoStack = [];
     this.dirty = false;
@@ -162,6 +187,7 @@ class PdfEngine {
     this.fileName = null;
     this.dirtyPages = new Set();
     this.coveredRegions = new Map();
+    this.ocrPages = new Set();
     this.undoStack = [];
     this.redoStack = [];
     this.dirty = false;
@@ -175,6 +201,7 @@ class PdfEngine {
     this.undoStack.push({
       bytes: await this.doc.save(),
       dirtyPages: new Set(this.dirtyPages),
+      ocrPages: new Set(this.ocrPages),
       coveredRegions: new Map(Array.from(this.coveredRegions, ([k, v]) => [k, v.slice()])),
     });
     if (this.undoStack.length > PdfEngine.MAX_HISTORY) this.undoStack.shift();
@@ -186,6 +213,7 @@ class PdfEngine {
     return {
       bytes: await this.doc.save(),
       dirtyPages: new Set(this.dirtyPages),
+      ocrPages: new Set(this.ocrPages),
       coveredRegions: new Map(Array.from(this.coveredRegions, ([k, v]) => [k, v.slice()])),
     };
   }
@@ -193,6 +221,7 @@ class PdfEngine {
   async _restoreSnapshot(snapshot) {
     this.doc = await PDFDocument.load(snapshot.bytes, { ignoreEncryption: true });
     this.dirtyPages = new Set(snapshot.dirtyPages);
+    this.ocrPages = new Set(snapshot.ocrPages || []);
     this.coveredRegions = new Map(Array.from(snapshot.coveredRegions, ([k, v]) => [k, v.slice()]));
     await this._refreshRenderDoc();
   }
@@ -227,6 +256,13 @@ class PdfEngine {
       if (m !== null) newDirty.add(m);
     }
     this.dirtyPages = newDirty;
+
+    const newOcr = new Set();
+    for (const idx of this.ocrPages) {
+      const m = mapFn(idx);
+      if (m !== null) newOcr.add(m);
+    }
+    this.ocrPages = newOcr;
 
     const newCovered = new Map();
     for (const [idx, rects] of this.coveredRegions) {
@@ -264,29 +300,48 @@ class PdfEngine {
     const page = this.doc.getPage(index);
     const { width, height } = page.getSize();
     const rotation = page.getRotation().angle;
-    const likelyScanned = await this._isLikelyScanned(index);
+    const { scanned: likelyScanned, textChars } = await this._scanStatus(index);
     return {
       widthPt: width,
       heightPt: height,
       rotation,
       sizeLabel: describeSize(width, height),
       likelyScanned,
+      textChars,
+      ocrDone: this.ocrPages.has(index),
     };
   }
 
-  async _isLikelyScanned(index) {
+  // A page "needs OCR" when it has no real text layer. That's not only
+  // "zero characters": scanners/PDF printers often leave a few stray characters
+  // (a stamp, a footer, a signature block) on top of what is really a full-page
+  // picture — so a page that is mostly one big image with little text counts too.
+  async _scanStatus(index) {
     try {
       const page = await this.renderDoc.getPage(index + 1);
       const content = await page.getTextContent();
-      const text = content.items.map((i) => i.str).join('').trim();
-      return text.length < 3;
+      const textChars = content.items.map((i) => i.str).join('').trim().length;
+      if (this.ocrPages.has(index)) return { scanned: false, textChars };
+      if (textChars < 3) return { scanned: true, textChars };
+      if (textChars >= 400) return { scanned: false, textChars };
+      const vp = page.getViewport({ scale: 1 });
+      const imgs = await this.getImageRects(index);
+      const biggest = imgs.reduce((m, r) => Math.max(m, (r.width * r.height) / (vp.width * vp.height)), 0);
+      return { scanned: biggest >= 0.6, textChars };
     } catch {
-      return false;
+      return { scanned: false, textChars: 0 };
     }
   }
 
-  async renderPageToCanvas(index, canvas, targetWidth) {
-    return renderPageOfDoc(this.renderDoc, index, canvas, targetWidth);
+  async renderPageToCanvas(index, canvas, targetWidth, opts) {
+    return renderPageOfDoc(this.renderDoc, index, canvas, targetWidth, opts);
+  }
+
+  // Raw pdf.js text items + style table, for building the selectable text layer.
+  async getTextItems(index) {
+    const page = await this.renderDoc.getPage(index + 1);
+    const { items, styles } = await page.getTextContent();
+    return { items: items.filter((i) => i.str), styles: styles || {} };
   }
 
   // Computes the viewport without painting anything — cheap (no canvas
@@ -312,6 +367,22 @@ class PdfEngine {
     await this._snapshot();
     this.doc.removePage(index);
     this._remapIndices((i) => (i === index ? null : i > index ? i - 1 : i));
+    await this._refreshRenderDoc();
+  }
+
+  // Deletes several pages under a single undo step.
+  async deletePages(indices) {
+    const sorted = [...new Set(indices)].sort((a, b) => a - b);
+    if (!sorted.length) return;
+    await this._snapshot();
+    for (let k = sorted.length - 1; k >= 0; k--) this.doc.removePage(sorted[k]);
+    const gone = new Set(sorted);
+    this._remapIndices((i) => {
+      if (gone.has(i)) return null;
+      let shift = 0;
+      for (const d of sorted) if (d < i) shift++;
+      return i - shift;
+    });
     await this._refreshRenderDoc();
   }
 
@@ -435,6 +506,7 @@ class PdfEngine {
     const { items, styles } = await page.getTextContent();
     const covered = this.coveredRegions.get(index) || [];
     const runs = [];
+    const fontCache = new Map();
     for (const item of items) {
       if (!item.str || !item.str.trim()) continue;
       const [, b, , d, e, f] = item.transform;
@@ -448,13 +520,18 @@ class PdfEngine {
       });
       if (isCovered) continue;
       const style = (styles && styles[item.fontName]) || {};
-      const family = (style.fontFamily || '').toLowerCase();
+      let guess = fontCache.get(item.fontName);
+      if (!guess) {
+        guess = await this.getFontGuess(index, item.fontName, style.fontFamily);
+        fontCache.set(item.fontName, guess);
+      }
       runs.push({
         text: item.str,
         rect,
-        fontSize: Math.max(6, Math.round(height)),
-        bold: /bold/.test(family),
-        italic: /italic|oblique/.test(family),
+        fontSize: Math.max(4, Math.round(height * 10) / 10),
+        fontFamily: guess.family,
+        bold: guess.bold,
+        italic: guess.italic,
       });
     }
     return runs;
@@ -501,30 +578,135 @@ class PdfEngine {
   // plausible cover colour (so a patch on a tinted report page blends in
   // instead of leaving a stark white/black box).
   async sampleBackgroundColor(index, rect) {
-    const page = await this.renderDoc.getPage(index + 1);
-    const scale = 1;
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    const p1 = viewport.convertToViewportPoint(rect.x, rect.y);
-    const p2 = viewport.convertToViewportPoint(rect.x + rect.width, rect.y + rect.height);
-    const left = Math.max(0, Math.floor(Math.min(p1[0], p2[0])) - 2);
-    const top = Math.max(0, Math.floor(Math.min(p1[1], p2[1])) - 2);
-    const w = Math.min(canvas.width - left, Math.ceil(Math.abs(p2[0] - p1[0])) + 4) || 1;
-    const h = Math.min(canvas.height - top, Math.ceil(Math.abs(p2[1] - p1[1])) + 4) || 1;
     try {
-      const data = ctx.getImageData(left, top, w, h).data;
-      let r = 0, g = 0, bl = 0, n = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        r += data[i]; g += data[i + 1]; bl += data[i + 2]; n++;
-      }
-      return { r: Math.round(r / n) / 255, g: Math.round(g / n) / 255, b: Math.round(bl / n) / 255 };
+      const { data, w, h, inner } = await this._renderRegion(index, rect);
+      const bg = dominantColor(data, w, h, (x, y) => x < inner.x0 || x >= inner.x1 || y < inner.y0 || y >= inner.y1)
+        || dominantColor(data, w, h, () => true);
+      return bg || { r: 1, g: 1, b: 1 };
     } catch {
       return { r: 1, g: 1, b: 1 };
     }
+  }
+
+  // Renders just the neighbourhood of `rect` and returns its pixels, plus
+  // where `rect` itself sits inside that crop. Far cheaper than rendering the
+  // whole page (an A3 drawing is millions of pixels) just to read a few.
+  async _renderRegion(index, rect, margin = 6, scale = 2) {
+    const page = await this.renderDoc.getPage(index + 1);
+    const base = page.getViewport({ scale });
+    const p1 = base.convertToViewportPoint(rect.x, rect.y);
+    const p2 = base.convertToViewportPoint(rect.x + rect.width, rect.y + rect.height);
+    const minX = Math.min(p1[0], p2[0]), maxX = Math.max(p1[0], p2[0]);
+    const minY = Math.min(p1[1], p2[1]), maxY = Math.max(p1[1], p2[1]);
+    const L = Math.max(0, Math.floor(minX) - margin);
+    const T = Math.max(0, Math.floor(minY) - margin);
+    const R = Math.min(Math.floor(base.width), Math.ceil(maxX) + margin);
+    const B = Math.min(Math.floor(base.height), Math.ceil(maxY) + margin);
+    const w = Math.max(1, R - L), h = Math.max(1, B - T);
+    const viewport = page.getViewport({ scale, offsetX: -L, offsetY: -T });
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, w, h);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    const data = ctx.getImageData(0, 0, w, h).data;
+    return {
+      data, w, h, viewport,
+      inner: { x0: Math.floor(minX) - L, y0: Math.floor(minY) - T, x1: Math.ceil(maxX) - L, y1: Math.ceil(maxY) - T },
+    };
+  }
+
+  // The area to paint over when replacing a text run: the run's box, pulled
+  // in from any edge where it would otherwise paint over a ruled line (e.g.
+  // the borders of a title-block cell the text sits in) — a text run's box is
+  // the full line height, which often reaches past the cell the glyphs are in.
+  // A "line" is a pixel row/column that is inked across nearly the whole crop.
+  async sampleCoverArea(index, rect) {
+    const fallback = { bg: { r: 1, g: 1, b: 1 }, cover: rect };
+    try {
+      const { data, w, h, inner, viewport } = await this._renderRegion(index, rect);
+      const outside = (x, y) => x < inner.x0 || x >= inner.x1 || y < inner.y0 || y >= inner.y1;
+      const bg = dominantColor(data, w, h, outside) || fallback.bg;
+      const br = bg.r * 255, bgG = bg.g * 255, bb = bg.b * 255;
+      const isInk = (x, y) => {
+        const i = (y * w + x) * 4;
+        return Math.abs(data[i] - br) + Math.abs(data[i + 1] - bgG) + Math.abs(data[i + 2] - bb) > 90;
+      };
+      const rowInk = new Array(h).fill(0);
+      const colInk = new Array(w).fill(0);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (isInk(x, y)) { rowInk[y]++; colInk[x]++; }
+      const LINE = 0.75;
+      const isRowLine = (y) => rowInk[y] >= w * LINE;
+      const isColLine = (x) => colInk[x] >= h * LINE;
+      let { x0, y0, x1, y1 } = inner;
+      x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(w, x1); y1 = Math.min(h, y1);
+      const innerW = x1 - x0, innerH = y1 - y0;
+      // Only edges: a line must sit in the outer 40% of the box to count as its border.
+      for (let y = y0; y < y0 + innerH * 0.4; y++) if (isRowLine(y)) y0 = Math.max(y0, y + 2);
+      for (let y = y1 - 1; y >= y1 - innerH * 0.4; y--) if (isRowLine(y)) y1 = Math.min(y1, y - 1);
+      for (let x = x0; x < x0 + innerW * 0.4; x++) if (isColLine(x)) x0 = Math.max(x0, x + 2);
+      for (let x = x1 - 1; x >= x1 - innerW * 0.4; x--) if (isColLine(x)) x1 = Math.min(x1, x - 1);
+      if (x1 <= x0 || y1 <= y0) return { bg, cover: rect };
+      const [ax, ay] = viewport.convertToPdfPoint(x0, y0);
+      const [bx, by] = viewport.convertToPdfPoint(x1, y1);
+      return { bg, cover: { x: Math.min(ax, bx), y: Math.min(ay, by), width: Math.abs(bx - ax), height: Math.abs(by - ay) } };
+    } catch {
+      return fallback;
+    }
+  }
+
+  // Background plus ink colour of a text run, so a replacement can look like
+  // the original. Ink = average of the pixels inside the run that differ most
+  // from the background.
+  async sampleTextStyle(index, rect) {
+    const fallback = { bg: { r: 1, g: 1, b: 1 }, inkHex: '#000000' };
+    try {
+      const { data, w, h, inner } = await this._renderRegion(index, rect);
+      const bg = dominantColor(data, w, h, (x, y) => x < inner.x0 || x >= inner.x1 || y < inner.y0 || y >= inner.y1)
+        || fallback.bg;
+      const br = bg.r * 255, bgG = bg.g * 255, bb = bg.b * 255;
+      const px = [];
+      for (let y = Math.max(0, inner.y0); y < Math.min(h, inner.y1); y++) {
+        for (let x = Math.max(0, inner.x0); x < Math.min(w, inner.x1); x++) {
+          const i = (y * w + x) * 4;
+          const d = Math.abs(data[i] - br) + Math.abs(data[i + 1] - bgG) + Math.abs(data[i + 2] - bb);
+          px.push([d, data[i], data[i + 1], data[i + 2]]);
+        }
+      }
+      if (!px.length) return { bg, inkHex: fallback.inkHex };
+      px.sort((a, b) => b[0] - a[0]);
+      const top = px.slice(0, Math.max(1, Math.floor(px.length * 0.08)));
+      if (top[0][0] < 90) return { bg, inkHex: fallback.inkHex }; // barely any contrast — keep default
+      const sum = top.reduce((acc, p) => [acc[0] + p[1], acc[1] + p[2], acc[2] + p[3]], [0, 0, 0]);
+      const hex = sum.map((v) => Math.round(v / top.length).toString(16).padStart(2, '0')).join('');
+      return { bg, inkHex: `#${hex}` };
+    } catch {
+      return fallback;
+    }
+  }
+
+  // Maps pdf.js's view of a run's font onto the closest of the three standard
+  // families we can actually embed, plus bold/italic. pdf.js knows the real
+  // font (name, serif/mono flags); fall back to matching on the name itself.
+  async getFontGuess(index, fontName, styleFamily) {
+    let family = 'Helvetica', bold = false, italic = false;
+    try {
+      const page = await this.renderDoc.getPage(index + 1);
+      const f = page.commonObjs.has(fontName) ? page.commonObjs.get(fontName) : null;
+      const name = (f?.name || '').toLowerCase();
+      // pdf.js classifies every font as serif / sans-serif / monospace (its
+      // `fallbackName`, mirrored in the text style table) — trust that first,
+      // and only use the font's own name where that says nothing. (Matching
+      // on the name alone misfires: "Century Gothic" is a sans.)
+      const generic = (f?.fallbackName || styleFamily || '').toLowerCase();
+      if (generic === 'monospace' || /courier|mono|consol|typewriter/.test(name)) family = 'Courier';
+      else if (generic === 'serif' || (!generic && /times|georgia|garamond|palatino|bookman|cambria/.test(name))) family = 'Times New Roman';
+      bold = !!(f?.bold || f?.black || /bold|black|heavy|semibold|demi/.test(name));
+      italic = !!(f?.italic || /italic|oblique/.test(name));
+    } catch { /* keep defaults */ }
+    return { family, bold, italic };
   }
 
   // Covers the original run's box and draws the new text in its place, then
@@ -533,12 +715,12 @@ class PdfEngine {
   async commitTextEdit(index, originalRect, originalText, text, style) {
     await this._snapshot();
     const page = this.doc.getPage(index);
-    const bg = await this.sampleBackgroundColor(index, originalRect);
+    const { bg, cover } = await this.sampleCoverArea(index, originalRect);
     page.drawRectangle({
-      x: originalRect.x - 1,
-      y: originalRect.y - 1,
-      width: originalRect.width + 2,
-      height: originalRect.height + 2,
+      x: cover.x,
+      y: cover.y,
+      width: cover.width,
+      height: cover.height,
       color: rgb(bg.r, bg.g, bg.b),
     });
     if (text.trim()) {
@@ -567,10 +749,14 @@ class PdfEngine {
 
   // --- Redaction -------------------------------------------------------------
 
-  async applyRedaction(index, rect, colorHex = '#111111') {
+  // `colorHex` null/undefined = blend in: fill with the page's own background.
+  async applyRedaction(index, rect, colorHex) {
     await this._snapshot();
     const page = this.doc.getPage(index);
-    page.drawRectangle({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, color: hexToRgb01(colorHex) });
+    let color;
+    if (colorHex) color = hexToRgb01(colorHex);
+    else { const bg = await this.sampleBackgroundColor(index, rect); color = rgb(bg.r, bg.g, bg.b); }
+    page.drawRectangle({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, color });
     this._markDirty(index, rect);
     await this._refreshRenderDoc();
   }
@@ -717,40 +903,113 @@ class PdfEngine {
       await worker.terminate();
     }
 
+    // Real text already on the page (a partly-scanned page) must not be doubled
+    // up by an OCR copy of the same words, so OCR words landing on it are dropped.
+    const existing = [];
+    try {
+      const { items } = await renderPage.getTextContent();
+      for (const it of items) {
+        if (!it.str || !it.str.trim()) continue;
+        existing.push({ x: it.transform[4] - 1, y: it.transform[5] - 1, w: (it.width || 0) + 2, h: (it.height || 10) + 2 });
+      }
+    } catch { /* no existing text to avoid */ }
+
     const docPage = this.doc.getPage(index);
     const font = await this.doc.embedFont(StandardFonts.Helvetica);
-    for (const word of flattenOcrWords(data)) {
-      if (!word.text || !word.text.trim()) continue;
-      const { x0, y0, x1, y1 } = word.bbox;
-      const widthPt = (x1 - x0) / OCR_SCALE;
-      const heightPt = (y1 - y0) / OCR_SCALE;
-      if (widthPt <= 0 || heightPt <= 0) continue;
-      // Canvas is top-left-origin/y-down at OCR_SCALE; PDF space is
-      // bottom-left-origin/y-up at 1:1 — flip and undo the render scale.
-      const x = x0 / OCR_SCALE;
-      const y = (viewport.height - y1) / OCR_SCALE;
-      // Pick a font size so Helvetica's natural width roughly matches the
-      // word's actual pixel width — pdf-lib has no text-scale (Tz) option to
-      // fit it exactly, and an invisible layer only needs to be close enough
-      // for selection/search, not pixel-perfect.
-      const naturalWidthAt1pt = font.widthOfTextAtSize(word.text, 1) || 1;
-      const fontSize = Math.max(4, Math.min(widthPt / naturalWidthAt1pt, heightPt * 1.3));
-      docPage.drawText(word.text, { x, y, size: fontSize, font, opacity: 0 });
+    const median = (arr) => { const t = [...arr].sort((x, y) => x - y); return t[Math.floor(t.length / 2)]; };
+    for (const line of flattenOcrLines(data)) {
+      // drop what the recogniser itself doesn't believe: low-confidence words
+      // and stray one-character marks ("|", "=") are scan noise, not text
+      const words = (line.words || []).filter((w) => {
+        const t = (w.text || '').trim();
+        if (!t) return false;
+        const conf = w.confidence ?? 100;
+        if (conf < 45) return false;
+        if (t.length === 1 && !/[A-Za-z0-9]/.test(t) && conf < 85) return false;
+        return true;
+      });
+      if (!words.length) continue;
+
+      // the line's baseline (image space, y down) — a sloped line on a skewed
+      // scan, so its height is worked out per word from x below
+      const bl = line.baseline;
+      const hasSlope = !!(bl && bl.has_baseline !== false && Number.isFinite(bl.y0) && Number.isFinite(bl.x0) && Math.abs(bl.x1 - bl.x0) > 20);
+      const slope = hasSlope ? (bl.y1 - bl.y0) / (bl.x1 - bl.x0) : 0;
+      const baseAt = (x) => (hasSlope ? bl.y0 + (x - bl.x0) * slope
+        : (bl && bl.has_baseline !== false && Number.isFinite(bl.y0)) ? (bl.y0 + bl.y1) / 2
+        : median(words.map((w) => w.bbox.y1)));
+      const lineBase = baseAt(median(words.map((w) => w.bbox.x0)));
+      // font size from ascender/cap height: the median distance from the
+      // baseline to the top of words that have one
+      const tall = words.filter((w) => /[A-Z0-9bdfhklt]/.test(w.text));
+      const rises = (tall.length ? tall : words).map((w) => baseAt(w.bbox.x0) - w.bbox.y0).filter((v) => v > 0);
+      const lineFs = rises.length ? Math.max(4, median(rises) / 0.72 / OCR_SCALE) : 0;
+
+      // The recogniser works on the rendered (y-down, scaled, and — if the
+      // page has a /Rotate — turned) image; the viewport maps that back to
+      // PDF user space, and the baseline direction there says how far to
+      // turn the text so it reads upright in the view.
+      const [bx, by] = viewport.convertToPdfPoint(0, lineBase);
+      const [bx2, by2] = viewport.convertToPdfPoint(1, lineBase);
+      const angle = (Math.atan2(by2 - by, bx2 - bx) * 180) / Math.PI;
+
+      // Words that already have real text under them are skipped; the rest are
+      // grouped into runs of closely spaced words. Each run is one string with
+      // real spaces in it — separately drawn words get merged by pdf.js with
+      // their spaces dropped ("CARDNO"), a string keeps them.
+      const fresh = words
+        .filter((w) => {
+          const [cx, cy] = viewport.convertToPdfPoint((w.bbox.x0 + w.bbox.x1) / 2, (w.bbox.y0 + w.bbox.y1) / 2);
+          return !existing.some((r) => cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h);
+        })
+        .sort((p, q) => p.bbox.x0 - q.bbox.x0);
+      const runs = [];
+      for (const w of fresh) {
+        const last = runs[runs.length - 1];
+        const gapPt = last ? (w.bbox.x0 - last.x1) / OCR_SCALE : Infinity;
+        if (last && gapPt < Math.max(6, 1.1 * (lineFs || 8))) {
+          last.text += ` ${w.text}`;
+          last.x1 = Math.max(last.x1, w.bbox.x1);
+          last.h = Math.max(last.h, w.bbox.y1 - w.bbox.y0);
+        } else {
+          runs.push({ text: w.text, x0: w.bbox.x0, x1: w.bbox.x1, h: w.bbox.y1 - w.bbox.y0 });
+        }
+      }
+      for (const run of runs) {
+        const widthPt = (run.x1 - run.x0) / OCR_SCALE;
+        if (widthPt <= 0) continue;
+        const [x, y] = viewport.convertToPdfPoint(run.x0, baseAt(run.x0));
+        // The line's font size, shrunk if Helvetica at that size would run
+        // well past the run's real width (pdf-lib can't squeeze glyphs).
+        const fitSize = widthPt / (font.widthOfTextAtSize(run.text, 1) || 1);
+        const fontSize = Math.max(4, lineFs ? Math.min(lineFs, fitSize * 1.25) : Math.min(fitSize, (run.h / OCR_SCALE) * 1.3));
+        docPage.drawText(run.text, { x, y, size: fontSize, font, opacity: 0, rotate: Math.abs(angle) > 0.5 ? degrees(angle) : undefined });
+      }
     }
 
+    this.ocrPages.add(index);
     await this._refreshRenderDoc();
   }
 }
 
-async function renderPageOfDoc(renderDoc, index, canvas, targetWidth) {
+// `outputScale` renders at higher pixel density than the CSS size (sharper on
+// hi-DPI screens); `onTask` hands back the pdf.js render task so a caller can
+// cancel a render that a newer zoom level has made obsolete.
+async function renderPageOfDoc(renderDoc, index, canvas, targetWidth, { outputScale = 1, onTask } = {}) {
   const page = await renderDoc.getPage(index + 1);
   const baseViewport = page.getViewport({ scale: 1 });
   const scale = targetWidth / baseViewport.width;
   const viewport = page.getViewport({ scale });
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
+  canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+  canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
   const ctx = canvas.getContext('2d');
-  await page.render({ canvasContext: ctx, viewport }).promise;
+  const task = page.render({
+    canvasContext: ctx,
+    viewport,
+    transform: outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : undefined,
+  });
+  onTask?.(task);
+  await task.promise;
   return { width: viewport.width, height: viewport.height, viewport };
 }
 

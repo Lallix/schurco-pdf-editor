@@ -5,7 +5,7 @@ let lastSignature = null;
 export function renderPropertiesPanel(container, state, actions) {
   const signature = JSON.stringify([
     state.isLoaded, state.selectedPageIndex, state.docRevision, state.activeTool,
-    state.textEdit, state.redactColor, state.selectedImage,
+    state.textEdit, state.redactColor, state.redactFill, state.selectedImage,
   ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
   lastSignature = signature;
@@ -76,16 +76,38 @@ function renderTextPanel(container, state, actions) {
 }
 
 function renderRedactPanel(container, state, actions) {
+  const modes = [
+    ['match', 'Match page'],
+    ['black', 'Black'],
+    ['custom', 'Custom'],
+  ];
   container.innerHTML = `
     <span class="panel-section-title">Redaction</span>
     <span class="panel-empty">Drag a box over anything on the page you want gone. It's permanently removed from the file — not just covered — once you export, so this can't be undone by re-opening the PDF elsewhere.</span>
 
     <div class="field">
-      <span class="field-label">Redaction colour</span>
-      <input type="color" data-role="color" value="${state.redactColor}" class="swatch" style="padding:0;cursor:pointer;" />
+      <span class="field-label">Fill</span>
+      <div class="segmented" role="radiogroup" aria-label="Redaction fill">
+        ${modes.map(([key, label]) => `
+          <button type="button" class="segmented-btn ${state.redactFill === key ? 'active' : ''}" role="radio" aria-checked="${state.redactFill === key}" data-fill="${key}">${label}</button>
+        `).join('')}
+      </div>
+      <span class="field-hint">${state.redactFill === 'match'
+        ? 'The area is filled with the surrounding page colour, so it simply looks blank — no black box.'
+        : state.redactFill === 'black' ? 'The area is covered with a solid black box.' : 'The area is covered with the colour you choose.'}</span>
     </div>
+
+    ${state.redactFill === 'custom' ? `
+      <div class="field">
+        <span class="field-label">Colour</span>
+        <input type="color" data-role="color" value="${state.redactColor}" class="swatch" style="padding:0;cursor:pointer;" />
+      </div>
+    ` : ''}
   `;
-  container.querySelector('[data-role="color"]').addEventListener('input', (e) => actions.onRedactColorChange(e.target.value));
+  container.querySelectorAll('[data-fill]').forEach((btn) => {
+    btn.addEventListener('click', () => actions.onRedactFillChange(btn.dataset.fill));
+  });
+  container.querySelector('[data-role="color"]')?.addEventListener('input', (e) => actions.onRedactColorChange(e.target.value));
 }
 
 function renderImagePanel(container, state, actions) {

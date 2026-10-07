@@ -4,17 +4,22 @@ let lastRevision = -1;
 let dragFromIndex = null;
 
 function iconSvg(path) {
-  return `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${path}</svg>`;
+  return `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${path}</svg>`;
 }
 
 export async function renderSidebar(container, state, actions) {
   const needsFullRender = state.docRevision !== lastRevision || container.dataset.rendered !== '1';
 
+  const countLabel = () => (state.checkedPages.size > 1 ? `${state.checkedPages.size} selected` : String(state.pageCount));
+
   if (!needsFullRender) {
     container.querySelectorAll('.thumb').forEach((el) => {
       const idx = Number(el.dataset.index);
       el.classList.toggle('selected', idx === state.selectedPageIndex);
+      el.classList.toggle('checked', state.checkedPages.has(idx));
     });
+    const countEl = container.querySelector('.sidebar-count');
+    if (countEl) countEl.textContent = countLabel();
     return;
   }
 
@@ -24,7 +29,7 @@ export async function renderSidebar(container, state, actions) {
   container.innerHTML = `
     <div class="sidebar-header">
       <span class="sidebar-title">Pages</span>
-      <span class="sidebar-count">${state.pageCount}</span>
+      <span class="sidebar-count">${countLabel()}</span>
     </div>
     <div class="thumb-list"></div>
     <button class="insert-page-btn" data-role="insert-page" ${state.isLoaded ? '' : 'disabled'}>
@@ -40,18 +45,20 @@ export async function renderSidebar(container, state, actions) {
 
   for (let i = 0; i < state.pageCount; i++) {
     const btn = document.createElement('button');
-    btn.className = `thumb ${i === state.selectedPageIndex ? 'selected' : ''}`;
+    btn.className = `thumb ${i === state.selectedPageIndex ? 'selected' : ''} ${state.checkedPages.has(i) ? 'checked' : ''}`;
     btn.dataset.index = String(i);
     btn.draggable = true;
+    btn.title = 'Click to open · Ctrl+click to add to a selection · Shift+click to select a range';
     btn.innerHTML = `
       <div class="thumb-canvas-wrap"><canvas></canvas></div>
       <div class="thumb-footer">
         <span class="thumb-label">Page ${i + 1}</span>
       </div>
+      <span class="thumb-check" aria-hidden="true">${iconSvg('<path d="M5 12.5l4.5 4.5L19 7.5"/>')}</span>
       <div class="thumb-actions">
-        <button class="thumb-action-btn" data-action="rotate" aria-label="Rotate page ${i + 1}">${iconSvg('<path d="M4.5 12a7.5 7.5 0 1 1 2.4 5.5"/><path d="M4.5 17v-4.3h4.3"/>')}</button>
-        <button class="thumb-action-btn" data-action="export" aria-label="Export page ${i + 1} as its own PDF">${iconSvg('<path d="M12 4v11M8 11l4 4 4-4"/><path d="M5 19h14"/>')}</button>
-        <button class="thumb-action-btn danger" data-action="delete" aria-label="Delete page ${i + 1}">${iconSvg('<path d="M5 7h14M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 13h8l1-13"/>')}</button>
+        <button class="thumb-action-btn" data-action="rotate" aria-label="Rotate page ${i + 1}" title="Rotate page ${i + 1}">${iconSvg('<path d="M4.5 12a7.5 7.5 0 1 1 2.4 5.5"/><path d="M4.5 17v-4.3h4.3"/>')}</button>
+        <button class="thumb-action-btn" data-action="export" aria-label="Export page ${i + 1} as its own PDF" title="Extract page ${i + 1} to its own PDF">${iconSvg('<path d="M12 4v11M8 11l4 4 4-4"/><path d="M5 19h14"/>')}</button>
+        <button class="thumb-action-btn danger" data-action="delete" aria-label="Delete page ${i + 1}" title="Delete page ${i + 1}">${iconSvg('<path d="M5 7h14M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M7 7l1 13h8l1-13"/>')}</button>
       </div>
     `;
     listEl.appendChild(btn);
@@ -60,7 +67,7 @@ export async function renderSidebar(container, state, actions) {
 
     btn.addEventListener('click', (e) => {
       if (e.target.closest('[data-action]')) return;
-      actions.onSelectPage(i);
+      actions.onPageClick(i, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey });
     });
 
     btn.querySelector('[data-action="rotate"]').addEventListener('click', (e) => {

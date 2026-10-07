@@ -2,9 +2,9 @@ import { state, update, subscribe } from './state.js';
 import { engine } from './pdf-engine.js';
 import { renderToolbar } from './ui/toolbar.js';
 import { renderSidebar } from './ui/sidebar.js';
-import { renderCanvas } from './ui/canvas.js';
+import { renderCanvas, wireWorkspace, captureZoomAnchor, setScrollIntent, MIN_ZOOM, MAX_ZOOM } from './ui/canvas.js';
 import { renderPropertiesPanel } from './ui/properties-panel.js';
-import { openInsertPageModal, openMergeModal, openOcrModal } from './ui/modals.js';
+import { openInsertPageModal, openMergeModal, openOcrModal, openExportOptionsModal } from './ui/modals.js';
 import { supportsFileSystemAccess, pickPdfToOpen, pickPdfSaveLocation, writeToHandle } from './file-io.js';
 import { buildDocxBlob, buildXlsxBlob } from './export-formats.js';
 
@@ -78,7 +78,20 @@ async function refreshAll(preferredSelectedIndex) {
     isDirty: engine.isDirty(),
     canUndo: engine.canUndo(),
     canRedo: engine.canRedo(),
+    checkedPages: new Set(),
   });
+}
+
+// Pages the page-level toolbar actions (delete / extract) apply to: the
+// ctrl/shift-selected set if there is one, else just the open page.
+function targetPages() {
+  if (state.checkedPages.size) return [...state.checkedPages].sort((a, b) => a - b);
+  return state.selectedPageIndex === null ? [] : [state.selectedPageIndex];
+}
+
+function containerCenter() {
+  const r = els.canvasArea.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
 }
 
 async function openOrMergeFiles(fileList) {
@@ -92,6 +105,7 @@ async function openOrMergeFiles(fileList) {
     if (!state.isLoaded) {
       const first = files[0];
       await engine.loadFromBytes(new Uint8Array(await first.arrayBuffer()), first.name);
+      update({ zoom: 1 });
       start = 1;
     }
     for (let i = start; i < files.length; i++) {
@@ -114,12 +128,41 @@ async function runOcrOnPages(indices, onProgress) {
   });
 }
 
-const STICKY_TOOLS = ['select', 'text', 'redact', 'image'];
+// Runs a Word/Excel conversion for the chosen pages and downloads the result,
+// then tells the user about anything that couldn't be converted properly.
+async function runConversion(label, ext, build, options) {
+  const indices = options.scope === 'selected' && state.checkedPages.size
+    ? [...state.checkedPages].sort((x, y) => x - y)
+    : Array.from({ length: state.pageCount }, (_, i) => i);
+  let warnings = [];
+  try {
+    await withBusy(`Converting to ${label}…`, async () => {
+      const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
+      const result = await build(indices, (n, total) => update({ busyMessage: `Converting to ${label} — page ${n} of ${total}…` }));
+      warnings = result.warnings || [];
+      downloadBlob(result.blob, `${base}.${ext}`);
+    });
+  } catch (err) {
+    window.alert(`Could not convert to ${label}: ${err.message}`);
+    return;
+  }
+  if (warnings.length) window.alert(`Exported, with notes:\n\n• ${[...new Set(warnings)].join('\n• ')}`);
+}
+
+const STICKY_TOOLS = ['select', 'pan', 'text', 'redact', 'image'];
 
 const actions = {
   onToolClick(key) {
     if (STICKY_TOOLS.includes(key)) {
       update({ activeTool: key, textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null });
+      return;
+    }
+    if (key === 'deletePages') {
+      actions.onDeleteSelectedPages();
+      return;
+    }
+    if (key === 'extractPages') {
+      actions.onExtractSelectedPages();
       return;
     }
     if (key === 'rotate') {
@@ -159,15 +202,18 @@ const actions = {
       return;
     }
     if (key === 'ocr') {
-      const scannedPages = state.pages
-        .map((p, i) => (p.likelyScanned ? i : null))
-        .filter((i) => i !== null);
-      if (!scannedPages.length) {
-        window.alert('No pages in this document appear to need OCR.');
-        return;
-      }
+      // Never refuse: detection is a heuristic, and the user knows better than
+      // it does whether a page is really a picture of text. Pages that look
+      // scanned come pre-ticked; if none do, the open page is pre-ticked.
+      const pages = state.pages.map((p, i) => ({
+        index: i,
+        scanned: !!p.likelyScanned,
+        ocrDone: !!p.ocrDone,
+        textChars: p.textChars || 0,
+      }));
       openOcrModal({
-        scannedPages,
+        pages,
+        currentIndex: state.selectedPageIndex ?? 0,
         onRun: (indices, onProgress) => runOcrOnPages(indices, onProgress),
       });
     }
@@ -186,23 +232,23 @@ const actions = {
     });
   },
 
-  async onExportWord() {
+  onExportWord() {
     if (!state.isLoaded) return;
-    await withBusy('Converting to Word…', async () => {
-      const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
-      const indices = Array.from({ length: state.pageCount }, (_, i) => i);
-      const blob = await buildDocxBlob(engine, indices);
-      downloadBlob(blob, `${base}.docx`);
+    openExportOptionsModal({
+      kind: 'word',
+      pageCount: state.pageCount,
+      selectedCount: state.checkedPages.size,
+      onRun: (o) => runConversion('Word', 'docx', (indices, progress) => buildDocxBlob(engine, indices, o, progress), o),
     });
   },
 
-  async onExportExcel() {
+  onExportExcel() {
     if (!state.isLoaded) return;
-    await withBusy('Converting to Excel…', async () => {
-      const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
-      const indices = Array.from({ length: state.pageCount }, (_, i) => i);
-      const blob = await buildXlsxBlob(engine, indices);
-      downloadBlob(blob, `${base}.xlsx`);
+    openExportOptionsModal({
+      kind: 'excel',
+      pageCount: state.pageCount,
+      selectedCount: state.checkedPages.size,
+      onRun: (o) => runConversion('Excel', 'xlsx', (indices, progress) => buildXlsxBlob(engine, indices, o, progress), o),
     });
   },
 
@@ -215,7 +261,7 @@ const actions = {
       await withBusy('Loading…', async () => {
         await engine.loadFromBytes(result.bytes, result.name);
         fileHandle = result.handle;
-        update({ activeTool: 'select' });
+        update({ activeTool: 'select', zoom: 1 });
         resetToolOverlays();
         await refreshAll(0);
       });
@@ -230,8 +276,76 @@ const actions = {
     update({ selectedPageIndex: clamp(i, 0, state.pageCount - 1) });
   },
 
-  onZoom(delta) {
-    update({ zoom: clamp(Math.round((state.zoom + delta) * 100) / 100, 0.25, 3) });
+  // Zoom by a factor around a screen point (the pointer for Ctrl+wheel, the
+  // workspace centre for the +/- buttons) so what you're looking at stays put.
+  onZoomBy(factor, point) {
+    const next = clamp(Math.round(state.zoom * factor * 100) / 100, MIN_ZOOM, MAX_ZOOM);
+    if (next === state.zoom) return;
+    const p = point || containerCenter();
+    captureZoomAnchor(els.canvasArea, p.x, p.y);
+    update({ zoom: next });
+  },
+
+  onZoomStep(direction) {
+    actions.onZoomBy(direction > 0 ? 1.25 : 1 / 1.25);
+  },
+
+  // 100% is "whole page fits the workspace", so fitting is just zoom = 1
+  // with the view recentred.
+  onFit() {
+    if (state.zoom === 1) {
+      // Nothing to re-render (the render signature is unchanged) — just recentre.
+      els.canvasArea.scrollTo({ left: 0, top: 0 });
+      return;
+    }
+    setScrollIntent('reset');
+    update({ zoom: 1 });
+  },
+
+  // Plain click selects one page; Ctrl/Cmd-click toggles it in a multi-selection;
+  // Shift-click selects the range from the open page.
+  onPageClick(i, { ctrl = false, shift = false } = {}) {
+    if (state.pageCount === 0) return;
+    if (shift && state.selectedPageIndex !== null) {
+      const from = Math.min(state.selectedPageIndex, i);
+      const to = Math.max(state.selectedPageIndex, i);
+      const range = new Set();
+      for (let k = from; k <= to; k++) range.add(k);
+      update({ checkedPages: range });
+      return;
+    }
+    if (ctrl) {
+      const next = new Set(state.checkedPages);
+      if (!next.size && state.selectedPageIndex !== null) next.add(state.selectedPageIndex);
+      if (next.has(i)) next.delete(i); else next.add(i);
+      update({ checkedPages: next, selectedPageIndex: i });
+      return;
+    }
+    update({ checkedPages: new Set(), selectedPageIndex: clamp(i, 0, state.pageCount - 1) });
+  },
+
+  async onDeleteSelectedPages() {
+    const indices = targetPages();
+    if (!indices.length) return;
+    const label = indices.length === state.pageCount
+      ? (indices.length === 1 ? 'Delete the only page in this document?' : `Delete all ${indices.length} pages in this document?`)
+      : indices.length === 1 ? `Delete page ${indices[0] + 1}?` : `Delete ${indices.length} pages (${indices.map((n) => n + 1).join(', ')})?`;
+    if (!window.confirm(label)) return;
+    await withBusy('Deleting…', async () => {
+      await engine.deletePages(indices);
+      await refreshAll(Math.max(0, indices[0] - 1));
+    });
+  },
+
+  async onExtractSelectedPages() {
+    const indices = targetPages();
+    if (!indices.length) return;
+    await withBusy('Extracting…', async () => {
+      const bytes = await engine.exportPages(indices);
+      const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
+      const tag = indices.length === 1 ? `page-${indices[0] + 1}` : `${indices.length}-pages`;
+      downloadBytes(bytes, `${base}-${tag}.pdf`);
+    });
   },
 
   async onRotatePage(idx, delta) {
@@ -279,15 +393,17 @@ const actions = {
 
   // --- Text editing ---------------------------------------------------
 
-  onStartTextEdit(pageIndex, run) {
+  async onStartTextEdit(pageIndex, run) {
+    // Pick up the original's ink colour so the replacement matches it.
+    const { inkHex } = await engine.sampleTextStyle(pageIndex, run.rect);
     update({
       textEdit: {
         pageIndex,
         rect: run.rect,
         text: run.text,
-        fontFamily: 'Helvetica',
+        fontFamily: run.fontFamily || 'Helvetica',
         fontSize: run.fontSize,
-        color: '#000000',
+        color: inkHex,
         bold: run.bold,
         italic: run.italic,
         underline: false,
@@ -323,12 +439,18 @@ const actions = {
   },
 
   onRedactColorChange(hex) {
-    update({ redactColor: hex });
+    update({ redactColor: hex, redactFill: 'custom' });
+  },
+
+  onRedactFillChange(mode) {
+    update({ redactFill: mode });
   },
 
   async onConfirmRedaction(pageIndex, rect) {
     await withBusy('Redacting…', async () => {
-      await engine.applyRedaction(pageIndex, rect, state.redactColor);
+      // 'match' passes no colour: the engine samples the page background.
+      const colorHex = state.redactFill === 'black' ? '#000000' : state.redactFill === 'custom' ? state.redactColor : null;
+      await engine.applyRedaction(pageIndex, rect, colorHex);
       update({ redactDraft: null });
       await refreshAll(pageIndex);
     });
@@ -447,6 +569,8 @@ const actions = {
       isDirty: false,
       canUndo: false,
       canRedo: false,
+      checkedPages: new Set(),
+      zoom: 1,
       textEdit: null,
       redactDraft: null,
       selectedImage: null,
@@ -466,6 +590,14 @@ function render() {
 
 subscribe(render);
 render();
+wireWorkspace(els.canvasArea, state, actions);
+
+// Re-fit when the window or a side panel changes the workspace size.
+let resizeRaf = 0;
+new ResizeObserver(() => {
+  if (resizeRaf) return;
+  resizeRaf = requestAnimationFrame(() => { resizeRaf = 0; render(); });
+}).observe(els.canvasArea);
 
 els.fileInput.addEventListener('change', () => {
   if (els.fileInput.files.length) openOrMergeFiles(els.fileInput.files);
@@ -482,7 +614,7 @@ els.openFileInput.addEventListener('change', async () => {
   if (!file) return;
   await withBusy('Loading…', async () => {
     await engine.loadFromBytes(new Uint8Array(await file.arrayBuffer()), file.name);
-    update({ activeTool: 'select' });
+    update({ activeTool: 'select', zoom: 1 });
     resetToolOverlays();
     await refreshAll(0);
   });
@@ -522,6 +654,12 @@ window.addEventListener('keydown', (e) => {
 
   const mod = e.ctrlKey || e.metaKey;
   if (!mod) return;
+  if (state.isLoaded && ['0', '=', '+', '-'].includes(e.key)) {
+    e.preventDefault(); // replace the browser's own page zoom with the document zoom
+    if (e.key === '0') actions.onFit();
+    else actions.onZoomStep(e.key === '-' ? -1 : 1);
+    return;
+  }
   if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return; // let the field handle its own undo/select-all
   const key = e.key.toLowerCase();
   if (key === 'z' && !e.shiftKey) { e.preventDefault(); actions.onUndo(); }

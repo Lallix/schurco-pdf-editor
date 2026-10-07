@@ -24,7 +24,8 @@ export const state = {
   // Phase 2 interactive tool state
   textEdit: null,      // { pageIndex, rect, text, fontFamily, fontSize, color, bold, italic, underline }
   redactDraft: null,   // { pageIndex, rect } — drawn, awaiting confirm
-  redactColor: '#111111',
+  redactFill: 'match', // 'match' = blend into the page background (default) | 'black' | 'custom'
+  redactColor: '#111111', // used when redactFill is 'custom'
   selectedImage: null, // { pageIndex, rect } — image tool selection
   cropDraft: null,     // { pageIndex, originalRect, keepRect? } — crop in progress
 };

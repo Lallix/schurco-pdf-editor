@@ -37,14 +37,30 @@ button { font-family: inherit; }
 /* ---------- Top toolbar ---------- */
 
 .toolbar {
-  height: 64px;
+  height: 68px;
   flex-shrink: 0;
   background: var(--dark);
   border-bottom: 1px solid var(--dark-line);
   display: flex;
   align-items: center;
-  padding: 0 20px;
-  gap: 20px;
+  padding: 0 16px;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* The toolbar has more (and bigger) buttons than a narrow window can hold, so
+   shed the least important chrome first: the privacy text, then the file name,
+   then the product name — never the tools themselves. */
+@media (max-width: 1620px) {
+  .privacy-badge span { display: none; }
+  .privacy-badge { padding: 0 11px; height: 36px; }
+}
+@media (max-width: 1500px) {
+  .doc-name { display: none; }
+}
+@media (max-width: 1360px) {
+  .brand-name { display: none; }
+  .toolbar { gap: 10px; }
 }
 
 .brand {
@@ -108,10 +124,10 @@ button { font-family: inherit; }
 }
 
 .tool-btn {
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   border: none;
-  border-radius: 8px;
+  border-radius: 9px;
   background: transparent;
   display: flex;
   align-items: center;
@@ -156,8 +172,8 @@ button { font-family: inherit; }
   background: var(--accent);
   border: none;
   border-radius: 8px;
-  padding: 0 16px;
-  height: 36px;
+  padding: 0 18px;
+  height: 44px;
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -281,6 +297,28 @@ button { font-family: inherit; }
   background: var(--accent-tint);
 }
 
+/* Multi-selection (Ctrl/Shift-click): ringed + a tick badge. */
+.thumb.checked {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.thumb-check {
+  display: none;
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  align-items: center;
+  justify-content: center;
+}
+.thumb-check svg { stroke: #FFFFFF; width: 13px; height: 13px; }
+.thumb.checked .thumb-check { display: flex; }
+
 .thumb.drag-over-top::before,
 .thumb.drag-over-bottom::after {
   content: '';
@@ -338,11 +376,12 @@ button { font-family: inherit; }
 }
 
 .thumb:hover .thumb-actions,
+.thumb.selected .thumb-actions,
 .thumb:focus-within .thumb-actions { display: flex; }
 
 .thumb-action-btn {
-  width: 22px;
-  height: 22px;
+  width: 30px;
+  height: 30px;
   border: none;
   background: transparent;
   border-radius: 4px;
@@ -386,12 +425,49 @@ button { font-family: inherit; }
   position: relative;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding-top: 30px;
   box-sizing: border-box;
   overflow: auto;
   min-width: 0;
 }
+
+/* The scrollable workspace around the sheet. It always fills the visible area
+   (min 100%) and grows with the page when zoomed, and the sheet is centred
+   with auto margins — unlike align-items:center, that keeps the left/top of an
+   oversized page reachable by scrolling. Its padding is the pasteboard: room
+   around the page where overlays and notes can sit outside the sheet. */
+.pasteboard {
+  flex: 0 0 auto;
+  display: flex;
+  box-sizing: border-box;
+  min-width: 100%;
+  min-height: 100%;
+  width: max-content;
+  padding: 72px 56px;
+}
+
+.text-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.text-layer span {
+  position: absolute;
+  white-space: pre;
+  color: transparent;
+  transform-origin: 0 0;
+}
+
+.text-layer ::selection { background: rgba(33, 130, 64, 0.35); }
+
+body.space-pan .canvas-area,
+body.space-pan .canvas-area * { cursor: grab !important; }
+body.panning,
+body.panning * { cursor: grabbing !important; user-select: none !important; }
 
 .empty-state {
   margin: auto;
@@ -439,7 +515,8 @@ button { font-family: inherit; }
 
 .page-sheet-wrap {
   flex-shrink: 0;
-  margin-bottom: 90px;
+  position: relative;
+  margin: auto;
 }
 
 .page-sheet {
@@ -456,17 +533,17 @@ button { font-family: inherit; }
   transform: translateX(calc(-50% + 110px));
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   background: var(--dark);
-  padding: 8px 10px 8px 16px;
+  padding: 6px 10px 6px 16px;
   border-radius: 999px;
   box-shadow: 0 10px 26px rgba(20, 22, 20, 0.28);
   z-index: 5;
 }
 
 .nav-pill-btn {
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   border: none;
   background: transparent;
   border-radius: 50%;
@@ -596,6 +673,28 @@ input.swatch {
 input.swatch::-webkit-color-swatch-wrapper { padding: 3px; }
 input.swatch::-webkit-color-swatch { border: none; border-radius: 5px; }
 input.swatch::-moz-color-swatch { border: none; border-radius: 5px; }
+
+.segmented {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.segmented-btn {
+  flex: 1 1 0;
+  height: 36px;
+  border: none;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.segmented-btn + .segmented-btn { border-left: 1px solid var(--line); }
+.segmented-btn:hover { background: var(--canvas); }
+.segmented-btn.active { background: var(--accent); color: #FFFFFF; font-weight: 600; }
 
 .section-divider {
   height: 1px;

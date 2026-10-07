@@ -1,4 +1,4 @@
-const CACHE = 'schurco-pdf-editor-v6';
+const CACHE = 'schurco-pdf-editor-v8';
 const ASSETS = [
   './',
   './index.html',
@@ -9,6 +9,7 @@ const ASSETS = [
   './js/pdf-engine.js',
   './js/file-io.js',
   './js/export-formats.js',
+  './js/layout.js',
   './js/ui/toolbar.js',
   './js/ui/sidebar.js',
   './js/ui/canvas.js',
@@ -18,7 +19,7 @@ const ASSETS = [
   './js/vendor/pdf.worker.min.mjs',
   './js/vendor/pdf-lib.esm.min.js',
   './js/vendor/docx.esm.js',
-  './js/vendor/xlsx.esm.mjs',
+  './js/vendor/exceljs.min.js',
   // WASM image/colour decoders — required for pdf.js to correctly render
   // some scanned PDFs (e.g. a JBIG2-masked image renders washed-out
   // without jbig2.wasm), so these are precached rather than left to

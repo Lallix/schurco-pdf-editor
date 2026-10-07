@@ -245,16 +245,19 @@ export function openMergeModal({ onDone }) {
   });
 }
 
-// `scannedPages` is an array of page indices already detected as having no
-// text layer. `onRun(indices, onProgress)` does the actual OCR work.
-export function openOcrModal({ scannedPages, onRun }) {
+// `pages` lists every page with what we know about it; pages that look scanned
+// are pre-ticked (or the open page, if none do). `onRun(indices, onProgress)`
+// does the actual OCR work.
+export function openOcrModal({ pages, currentIndex, onRun }) {
+  const anyScanned = pages.some((p) => p.scanned);
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
   backdrop.innerHTML = `
     <div class="modal" role="dialog" aria-label="Run OCR">
       <h3>Run OCR</h3>
       <span class="panel-empty">Makes the selected pages' text searchable, selectable, and copyable — the pages will look identical. Runs entirely in this browser; nothing is uploaded.</span>
-      <div data-role="page-list" style="display:flex;flex-direction:column;gap:8px;max-height:240px;overflow-y:auto;"></div>
+      ${anyScanned ? '' : '<span class="field-hint" style="color:var(--ink);">None of the pages look scanned, but you can still run OCR on any page — tick the ones you want. Real text already on a page is left alone.</span>'}
+      <div data-role="page-list" style="display:flex;flex-direction:column;gap:8px;max-height:260px;overflow-y:auto;"></div>
       <span data-role="progress" class="field-hint" style="display:none;"></span>
       <div class="modal-actions">
         <button type="button" class="btn-secondary" data-role="cancel">Cancel</button>
@@ -265,17 +268,23 @@ export function openOcrModal({ scannedPages, onRun }) {
   document.body.appendChild(backdrop);
 
   const listEl = backdrop.querySelector('[data-role="page-list"]');
-  const checked = new Set(scannedPages);
+  const checked = new Set(anyScanned ? pages.filter((p) => p.scanned).map((p) => p.index) : [currentIndex]);
   const runBtn = backdrop.querySelector('[data-role="run"]');
   const cancelBtn = backdrop.querySelector('[data-role="cancel"]');
   const progressEl = backdrop.querySelector('[data-role="progress"]');
 
-  scannedPages.forEach((idx) => {
+  const describe = (p) => {
+    if (p.ocrDone) return 'OCR already run';
+    if (p.scanned) return p.textChars < 3 ? 'scanned — no selectable text' : 'looks scanned';
+    return `has selectable text (${p.textChars} characters)`;
+  };
+  pages.forEach((p) => {
     const row = document.createElement('label');
     row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink);cursor:pointer;';
-    row.innerHTML = `<input type="checkbox" checked data-idx="${idx}" /><span>Page ${idx + 1}</span>`;
+    row.innerHTML = `<input type="checkbox" ${checked.has(p.index) ? 'checked' : ''} data-idx="${p.index}" /><span>Page ${p.index + 1}</span><span style="color:var(--muted);font-size:11.5px;">${describe(p)}</span>`;
     listEl.appendChild(row);
   });
+  runBtn.disabled = checked.size === 0;
   listEl.addEventListener('change', (e) => {
     const cb = e.target.closest('input[type="checkbox"]');
     if (!cb) return;
@@ -304,5 +313,70 @@ export function openOcrModal({ scannedPages, onRun }) {
       cancelBtn.disabled = false;
       listEl.querySelectorAll('input').forEach((cb) => { cb.disabled = false; });
     }
+  });
+}
+
+
+// Options dialog shown before a Word / Excel export. `onRun(options)` receives
+// { scope: 'all' | 'selected', ...format options } and does the export.
+export function openExportOptionsModal({ kind, pageCount, selectedCount, onRun }) {
+  const isWord = kind === 'word';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const radio = (name, value, label, checked, hint = '') => `
+    <label style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--ink);cursor:pointer;">
+      <input type="radio" name="${name}" value="${value}" ${checked ? 'checked' : ''} style="margin-top:3px;" />
+      <span>${label}${hint ? `<br><span style="color:var(--muted);font-size:11.5px;">${hint}</span>` : ''}</span>
+    </label>`;
+  const check = (name, label, checked, hint = '') => `
+    <label style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--ink);cursor:pointer;">
+      <input type="checkbox" name="${name}" ${checked ? 'checked' : ''} style="margin-top:3px;" />
+      <span>${label}${hint ? `<br><span style="color:var(--muted);font-size:11.5px;">${hint}</span>` : ''}</span>
+    </label>`;
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-label="Export to ${isWord ? 'Word' : 'Excel'}">
+      <h3>Export to ${isWord ? 'Word' : 'Excel'}</h3>
+      <span class="panel-empty">The page layout is rebuilt rather than copied: tables become real tables, columns stay side by side, and text keeps its font, size, colour and alignment. Complex pages won't be pixel-perfect. Scanned pages need OCR first. Nothing is uploaded.</span>
+      ${selectedCount > 1 ? `
+        <div class="field">
+          <span class="field-label">Pages</span>
+          ${radio('scope', 'all', `All pages (${pageCount})`, false)}
+          ${radio('scope', 'selected', `Selected pages (${selectedCount})`, true)}
+        </div>` : ''}
+      ${isWord ? `
+        <div class="field">
+          <span class="field-label">Include</span>
+          ${check('images', 'Pictures and line art', true)}
+          ${check('background', 'Page backgrounds', false, 'Full-page artwork such as a letterhead. Leave off for easier editing.')}
+        </div>` : `
+        <div class="field">
+          <span class="field-label">Layout</span>
+          ${radio('mode', 'layout', 'Keep page layout', true, 'One sheet per page, text placed on a cell grid that follows the page.')}
+          ${radio('mode', 'tables', 'Tables only', false, 'One sheet per ruled table — best for data you want to calculate with.')}
+        </div>
+        <div class="field">
+          <span class="field-label">Include</span>
+          ${check('images', 'Pictures and line art (page layout mode)', true)}
+        </div>`}
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" data-role="cancel">Cancel</button>
+        <button type="button" class="btn-primary" data-role="run">Export</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+  const val = (name) => backdrop.querySelector(`input[name="${name}"]:checked`)?.value;
+  const on = (name) => !!backdrop.querySelector(`input[name="${name}"]`)?.checked;
+  backdrop.querySelector('[data-role="cancel"]').addEventListener('click', () => closeModal(backdrop));
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(backdrop); });
+  backdrop.querySelector('[data-role="run"]').addEventListener('click', () => {
+    const options = {
+      scope: selectedCount > 1 ? val('scope') : 'all',
+      keepImages: on('images'),
+      keepBackground: isWord ? on('background') : false,
+      mode: isWord ? undefined : val('mode'),
+    };
+    closeModal(backdrop);
+    onRun(options);
   });
 }
