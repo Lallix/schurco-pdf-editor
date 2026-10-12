@@ -738,37 +738,43 @@ class PdfEngine {
   // marks the page dirty so export rasterizes it and the original glyphs are
   // guaranteed gone from the file (see _buildExportDoc).
   async commitTextEdit(index, originalRect, originalText, text, style) {
+    return this.commitTextEdits([{ pageIndex: index, rect: originalRect, originalText, text, style }]);
+  }
+
+  // Applies several text edits as ONE undo step. Every cover colour is sampled
+  // from the page as it was *before* any of the edits, then they are all drawn.
+  async commitTextEdits(edits) {
+    if (!edits.length) return;
     await this._snapshot();
-    const page = this.doc.getPage(index);
-    const { bg, cover } = await this.sampleCoverArea(index, originalRect);
-    page.drawRectangle({
-      x: cover.x,
-      y: cover.y,
-      width: cover.width,
-      height: cover.height,
-      color: rgb(bg.r, bg.g, bg.b),
-    });
-    if (text.trim()) {
-      const font = await this.doc.embedFont(pickStandardFont(style.fontFamily, style.bold, style.italic));
-      page.drawText(text, {
-        x: originalRect.x,
-        y: originalRect.y + originalRect.height * 0.2,
-        size: style.fontSize,
-        font,
-        color: hexToRgb01(style.color),
-      });
-      if (style.underline) {
-        const width = font.widthOfTextAtSize(text, style.fontSize);
-        const underlineY = originalRect.y + originalRect.height * 0.18;
-        page.drawLine({
-          start: { x: originalRect.x, y: underlineY },
-          end: { x: originalRect.x + width, y: underlineY },
-          thickness: Math.max(0.5, style.fontSize * 0.05),
+    const covers = [];
+    for (const e of edits) covers.push(await this.sampleCoverArea(e.pageIndex, e.rect));
+    for (let i = 0; i < edits.length; i++) {
+      const { pageIndex: index, rect: originalRect, originalText, text, style } = edits[i];
+      const page = this.doc.getPage(index);
+      const { bg, cover } = covers[i];
+      page.drawRectangle({ x: cover.x, y: cover.y, width: cover.width, height: cover.height, color: rgb(bg.r, bg.g, bg.b) });
+      if (text.trim()) {
+        const font = await this.doc.embedFont(pickStandardFont(style.fontFamily, style.bold, style.italic));
+        page.drawText(text, {
+          x: originalRect.x,
+          y: originalRect.y + originalRect.height * 0.2,
+          size: style.fontSize,
+          font,
           color: hexToRgb01(style.color),
         });
+        if (style.underline) {
+          const width = font.widthOfTextAtSize(text, style.fontSize);
+          const underlineY = originalRect.y + originalRect.height * 0.18;
+          page.drawLine({
+            start: { x: originalRect.x, y: underlineY },
+            end: { x: originalRect.x + width, y: underlineY },
+            thickness: Math.max(0.5, style.fontSize * 0.05),
+            color: hexToRgb01(style.color),
+          });
+        }
       }
+      this._markDirty(index, originalRect, originalText);
     }
-    this._markDirty(index, originalRect, originalText);
     await this._refreshRenderDoc();
   }
 
@@ -783,6 +789,23 @@ class PdfEngine {
     else { const bg = await this.sampleBackgroundColor(index, rect); color = rgb(bg.r, bg.g, bg.b); }
     page.drawRectangle({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, color });
     this._markDirty(index, rect);
+    await this._refreshRenderDoc();
+  }
+
+  // Applies several redactions as ONE undo step. `marks` = [{ pageIndex, rect }].
+  async applyRedactions(marks, colorHex) {
+    if (!marks.length) return;
+    await this._snapshot();
+    // sample every background first, from the pre-redaction render
+    const colors = [];
+    for (const m of marks) {
+      if (colorHex) colors.push(hexToRgb01(colorHex));
+      else { const bg = await this.sampleBackgroundColor(m.pageIndex, m.rect); colors.push(rgb(bg.r, bg.g, bg.b)); }
+    }
+    marks.forEach((m, i) => {
+      this.doc.getPage(m.pageIndex).drawRectangle({ x: m.rect.x, y: m.rect.y, width: m.rect.width, height: m.rect.height, color: colors[i] });
+      this._markDirty(m.pageIndex, m.rect);
+    });
     await this._refreshRenderDoc();
   }
 

@@ -1140,3 +1140,22 @@ input.swatch::-moz-color-swatch { border: none; border-radius: 5px; }
 
 input[type="search"].field-box { -webkit-appearance: none; appearance: none; outline: none; }
 input[type="search"].field-box:focus { border-color: var(--accent) !important; }
+
+
+/* Text selection: only the text layer is selectable, and a drag can't leak out of it. */
+.canvas-area { user-select: none; -webkit-user-select: none; }
+.text-layer, .text-layer span { user-select: text; -webkit-user-select: text; }
+.text-layer span { z-index: 1; }
+.text-layer .end-of-content {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.text-layer.selecting .end-of-content { top: 0; }
+.canvas-area input, .canvas-area textarea { user-select: text; -webkit-user-select: text; }
+.te-input:focus { box-shadow: 0 0 0 3px rgba(33, 130, 64, 0.3); }
+.te-input:focus { width: max(100%, 220px) !important; position: relative; z-index: 5; }

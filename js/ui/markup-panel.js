@@ -77,6 +77,10 @@ export function renderMarkupPanel(container, state, actions) {
   const showWidth = kind && !NO_WIDTH.has(kind);
   const showText = kind && TEXT_KINDS.has(kind);
   const showFill = kind && FILL_KINDS.has(kind);
+  const showCloud = kind === 'PolygonCloud';
+  const align = sel ? sel.align || 'left' : style.align || 'left';
+  const arc = sel ? sel.arc || 10 : style.arc || 10;
+  const invert = sel ? !!sel.invert : !!style.invert;
 
   container.innerHTML = `
     <span class="panel-section-title">${sel ? `Selected: ${esc(sel.type)}` : esc(toolLabel)}</span>
@@ -114,6 +118,33 @@ export function renderMarkupPanel(container, state, actions) {
         </div>` : ''}
     </div>
 
+    ${showText ? `
+      <div class="field">
+        <span class="field-label">Text alignment</span>
+        <div class="segmented" role="radiogroup" aria-label="Text alignment">
+          ${[['left', 'Left', '<path d="M4 6h16M4 10h10M4 14h16M4 18h10"/>'], ['center', 'Centre', '<path d="M4 6h16M7 10h10M4 14h16M7 18h10"/>'], ['right', 'Right', '<path d="M4 6h16M10 10h10M4 14h16M10 18h10"/>']].map(([k, label, icon]) => `
+            <button type="button" class="segmented-btn ${align === k ? 'active' : ''}" role="radio" aria-checked="${align === k}" data-align="${k}" title="${label}" aria-label="${label}">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;">${icon}</svg>
+            </button>`).join('')}
+        </div>
+      </div>` : ''}
+
+    ${showCloud ? `
+      <div class="field">
+        <span class="field-label">Cloud scallop size</span>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <input type="range" min="4" max="40" step="1" value="${arc}" data-role="arc" style="flex:1;accent-color:var(--accent);" />
+          <span class="field-hint" data-role="arc-label" style="min-width:34px;text-align:right;">${Math.round(arc)} pt</span>
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${[['Small', 6], ['Medium', 10], ['Large', 18], ['X-Large', 28]].map(([l, v]) => `<button type="button" class="btn-secondary" data-arc-preset="${v}" style="flex:1;height:28px;padding:0;font-size:11px;${Math.round(arc) === v ? 'border-color:var(--accent);color:var(--accent);' : ''}">${l}</button>`).join('')}
+        </div>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Invert (scallops point inward)</span>
+        <button type="button" class="toggle ${invert ? 'on' : ''}" data-role="invert" role="switch" aria-checked="${invert}" aria-label="Invert cloud"><span class="toggle-knob"></span></button>
+      </div>` : ''}
+
     ${showFill ? `
       <div class="field">
         <span class="field-label">Fill</span>
@@ -146,6 +177,12 @@ export function renderMarkupPanel(container, state, actions) {
   container.querySelector('[data-role="color"]')?.addEventListener('change', (e) => apply({ color: e.target.value.toUpperCase() }));
   container.querySelector('[data-role="width"]')?.addEventListener('change', (e) => apply({ lineWidth: Number(e.target.value) }));
   container.querySelector('[data-role="fontsize"]')?.addEventListener('change', (e) => apply({ fontSize: Math.max(6, Math.min(48, Number(e.target.value) || 10)) }));
+  container.querySelectorAll('[data-align]').forEach((b) => b.addEventListener('click', () => apply({ align: b.dataset.align })));
+  const arcInput = container.querySelector('[data-role="arc"]');
+  arcInput?.addEventListener('input', () => { container.querySelector('[data-role="arc-label"]').textContent = `${arcInput.value} pt`; });
+  arcInput?.addEventListener('change', () => apply({ arc: Number(arcInput.value) }));
+  container.querySelectorAll('[data-arc-preset]').forEach((b) => b.addEventListener('click', () => apply({ arc: Number(b.dataset.arcPreset) })));
+  container.querySelector('[data-role="invert"]')?.addEventListener('click', () => apply({ invert: !invert }));
   container.querySelector('[data-role="fill"]')?.addEventListener('change', (e) => apply({ fill: e.target.value }));
   container.querySelector('[data-role="save-comment"]')?.addEventListener('click', () => actions.onSetMarkupText(sel.ref, container.querySelector('[data-role="comment"]').value));
   container.querySelector('[data-role="delete"]')?.addEventListener('click', () => actions.onDeleteMarkup(sel.ref));

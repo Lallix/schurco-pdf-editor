@@ -26,7 +26,7 @@ let pendingImageReplace = null; // { pageIndex, rect } captured just before open
 let fileHandle = null; // FileSystemFileHandle for the open document, if opened/saved via that API
 
 function resetToolOverlays() {
-  update({ textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null });
+  update({ textEdits: [], activeTextEdit: null, redactMarks: [], selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null });
 }
 
 function confirmDiscardIfDirty(message) {
@@ -167,13 +167,16 @@ function ensureAuthor() {
 
 const FILL_HEX = { none: null, white: '#FFFFFF', yellow: '#FFF2A8' };
 
+let textEditSeq = 0;
+const styleKey = (e) => JSON.stringify([e.fontFamily, e.fontSize, e.color, e.bold, e.italic, e.underline]);
+
 const STICKY_TOOLS = ['select', 'pan', 'text', 'redact', 'image', 'markup'];
 
 const actions = {
   onToolClick(key) {
     if (STICKY_TOOLS.includes(key)) {
       cancelCloud();
-      update({ activeTool: key, textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null, markupListOpen: key === 'markup' ? state.markupListOpen : false });
+      update({ activeTool: key, textEdits: [], activeTextEdit: null, redactMarks: [], selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null, markupListOpen: key === 'markup' ? state.markupListOpen : false });
       return;
     }
     if (key === 'deletePages') {
@@ -412,49 +415,78 @@ const actions = {
 
   // --- Text editing ---------------------------------------------------
 
+  // Any number of runs can be open for editing at once; they are applied together.
   async onStartTextEdit(pageIndex, run) {
+    const existing = state.textEdits.find((e) => e.pageIndex === pageIndex && e.rect.x === run.rect.x && e.rect.y === run.rect.y);
+    if (existing) { update({ activeTextEdit: existing.id }); return; }
     // Pick up the original's ink colour so the replacement matches it.
     const { inkHex } = await engine.sampleTextStyle(pageIndex, run.rect);
-    update({
-      textEdit: {
-        pageIndex,
-        rect: run.rect,
-        text: run.text,
-        fontFamily: run.fontFamily || 'Helvetica',
-        fontSize: run.fontSize,
-        color: inkHex,
-        bold: run.bold,
-        italic: run.italic,
-        underline: false,
-      },
-    });
+    const edit = {
+      id: ++textEditSeq,
+      pageIndex,
+      rect: run.rect,
+      text: run.text,
+      draft: run.text,
+      fontFamily: run.fontFamily || 'Helvetica',
+      fontSize: run.fontSize,
+      color: inkHex,
+      bold: run.bold,
+      italic: run.italic,
+      underline: false,
+    };
+    edit.initial = styleKey(edit);
+    update({ textEdits: [...state.textEdits, edit], activeTextEdit: edit.id });
+  },
+
+  onFocusTextEdit(id) {
+    if (state.activeTextEdit !== id) update({ activeTextEdit: id });
   },
 
   onTextStyleChange(patch) {
-    if (!state.textEdit) return;
-    update({ textEdit: { ...state.textEdit, ...patch } });
+    if (state.activeTextEdit === null) return;
+    update({ textEdits: state.textEdits.map((e) => (e.id === state.activeTextEdit ? { ...e, ...patch } : e)) });
+  },
+
+  onRemoveTextEdit(id) {
+    const rest = state.textEdits.filter((e) => e.id !== id);
+    update({ textEdits: rest, activeTextEdit: rest.length ? rest[rest.length - 1].id : null });
   },
 
   onCancelTextEdit() {
-    update({ textEdit: null });
+    update({ textEdits: [], activeTextEdit: null });
   },
 
-  async onCommitTextEdit(pageIndex, rect, originalText, text, style) {
-    await withBusy('Applying edit…', async () => {
-      await engine.commitTextEdit(pageIndex, rect, originalText, text, style);
-      update({ textEdit: null });
-      await refreshAll(pageIndex);
+  async onCommitTextEdits() {
+    // an edit that was opened but not changed is left alone
+    const changed = state.textEdits.filter((e) => e.draft !== e.text || styleKey(e) !== e.initial);
+    if (!changed.length) { update({ textEdits: [], activeTextEdit: null }); return; }
+    const page = changed[changed.length - 1].pageIndex;
+    await withBusy(changed.length > 1 ? `Applying ${changed.length} edits…` : 'Applying edit…', async () => {
+      await engine.commitTextEdits(changed.map((e) => ({
+        pageIndex: e.pageIndex,
+        rect: e.rect,
+        originalText: e.text,
+        text: e.draft,
+        style: { fontFamily: e.fontFamily, fontSize: e.fontSize, color: e.color, bold: e.bold, italic: e.italic, underline: e.underline },
+      })));
+      update({ textEdits: [], activeTextEdit: null });
+      await refreshAll(page);
     });
   },
 
   // --- Redaction --------------------------------------------------------
 
+  // Boxes accumulate: mark as many areas as you like, then apply them together.
   onRedactDrawn(pageIndex, rect) {
-    update({ redactDraft: { pageIndex, rect } });
+    update({ redactMarks: [...state.redactMarks, { pageIndex, rect }] });
+  },
+
+  onRemoveRedactMark(index) {
+    update({ redactMarks: state.redactMarks.filter((_, i) => i !== index) });
   },
 
   onCancelRedaction() {
-    update({ redactDraft: null });
+    update({ redactMarks: [] });
   },
 
   onRedactColorChange(hex) {
@@ -465,13 +497,16 @@ const actions = {
     update({ redactFill: mode });
   },
 
-  async onConfirmRedaction(pageIndex, rect) {
-    await withBusy('Redacting…', async () => {
+  async onConfirmRedaction() {
+    const marks = state.redactMarks;
+    if (!marks.length) return;
+    const page = state.selectedPageIndex;
+    await withBusy(marks.length > 1 ? `Redacting ${marks.length} areas…` : 'Redacting…', async () => {
       // 'match' passes no colour: the engine samples the page background.
       const colorHex = state.redactFill === 'black' ? '#000000' : state.redactFill === 'custom' ? state.redactColor : null;
-      await engine.applyRedaction(pageIndex, rect, colorHex);
-      update({ redactDraft: null });
-      await refreshAll(pageIndex);
+      await engine.applyRedactions(marks, colorHex);
+      update({ redactMarks: [] });
+      await refreshAll(page);
     });
   },
 
@@ -553,6 +588,9 @@ const actions = {
       fontSize: st.fontSize,
       fill: st.fill === 'auto' ? (isText ? '#FFFFFF' : null) : FILL_HEX[st.fill] ?? null,
       opacity: kind === 'Highlight' ? 0.5 : 1,
+      align: st.align || 'left',
+      arc: st.arc ?? undefined,
+      invert: !!st.invert,
     };
     try {
       await engine.addMarkup(full);
@@ -698,8 +736,9 @@ const actions = {
       canRedo: false,
       checkedPages: new Set(),
       zoom: 1,
-      textEdit: null,
-      redactDraft: null,
+      textEdits: [],
+      activeTextEdit: null,
+      redactMarks: [],
       selectedImage: null,
       cropDraft: null,
     });
@@ -773,6 +812,11 @@ window.addEventListener('keydown', (e) => {
   // Text, Redact, Edit Image) — works whether you're mid-edit (an input may
   // have already handled/bubbled the key) or just browsing, e.g. the Edit
   // Text tool's highlighted-runs view with nothing selected yet.
+  if (e.key === 'Escape' && state.activeTool === 'text' && state.textEdits.length) {
+    e.preventDefault();
+    actions.onCancelTextEdit(); // first Esc drops the open edits; a second leaves the tool
+    return;
+  }
   if (e.key === 'Escape' && state.activeTool === 'markup') {
     if (state.markupDraft) { e.preventDefault(); actions.onMarkupDraft(null); return; }
     if (state.selectedMarkup) { e.preventDefault(); update({ selectedMarkup: null }); return; }

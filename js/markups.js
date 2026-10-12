@@ -164,7 +164,12 @@ export function readMarkups(doc) {
       if (kindKey === 'FreeTextCallout' && rd && rd.length === 4) box = [rect[0] + rd[0], rect[1] + rd[1], rect[2] - rd[2], rect[3] - rd[3]];
       else if (subtype === 'FreeText') box = rect;
       const clArr = getNums(doc, a, 'CL');
+      const sch = get(doc, a, 'SCHCloud');
+      const q = getNum(doc, a, 'Q');
       out.push({
+        align: q === 1 ? 'center' : q === 2 ? 'right' : 'left',
+        arc: sch instanceof PDFDict ? getNum(doc, sch, 'Arc') : undefined,
+        invert: sch instanceof PDFDict ? get(doc, sch, 'Invert')?.toString() === 'true' : false,
         line: lArr && lArr.length >= 4 ? lArr.slice(0, 4) : null,
         points: verts && verts.length >= 6 ? verts : null,
         box,
@@ -246,22 +251,20 @@ function form(doc, { content, w, h, fonts = {}, gs = {} }) {
   return doc.context.register(stream);
 }
 
-function textBoxContent({ w, h, lines, fontSize, color, fill, border, boxX = 0, boxY = 0, boxW = w, boxH = h }) {
+function textBoxContent({ w, h, lines, widths, align = 'left', fontSize, color, fill, border, boxX = 0, boxY = 0, boxW = w, boxH = h }) {
   let c = 'q\n';
   if (fill) c += `${rg(fill)} rg ${N(boxX)} ${N(boxY)} ${N(boxW)} ${N(boxH)} re f\n`;
   if (border > 0) c += `${rg(color)} RG ${N(border)} w ${N(boxX + border / 2)} ${N(boxY + border / 2)} ${N(boxW - border)} ${N(boxH - border)} re S\n`;
   c += `BT /Helv ${N(fontSize)} Tf ${rg(color)} rg\n`;
   let y = boxY + boxH - PAD - fontSize * 0.93;
   const lh = fontSize * 1.2;
-  let first = true;
-  let lastY = 0;
-  for (const line of lines) {
-    if (first) { c += `${N(boxX + PAD)} ${N(y)} Td\n`; first = false; } else c += `0 ${N(-lh)} Td\n`;
-    c += `${lit(line)} Tj\n`;
-    lastY = y; y -= lh;
-  }
+  lines.forEach((line, i) => {
+    const lw = widths?.[i] ?? 0;
+    const x = align === 'center' ? boxX + (boxW - lw) / 2 : align === 'right' ? boxX + boxW - PAD - lw : boxX + PAD;
+    c += `1 0 0 1 ${N(x)} ${N(y)} Tm ${lit(line)} Tj\n`;
+    y -= lh;
+  });
   c += 'ET\nQ\n';
-  void lastY;
   return c;
 }
 
@@ -283,14 +286,17 @@ function arrowHead(kind, tip, from, size, lw, color) {
 }
 
 // Scalloped cloud outline through `pts` (closed). Returns path operators.
-function cloudPath(pts, arc) {
-  // orientation: positive area = counter-clockwise (y up); bulge outward
+// Each edge is cut into equal scallops about `arc` long, each a semicircle-like
+// bulge on the outside of the shape (or on the inside when `invert` is set).
+function cloudPath(pts, arc, invert = false) {
+  // shoelace sign gives the winding; for a positive area the outward normal of
+  // edge p->q is its right-hand side (dy, -dx)
   let area = 0;
   for (let i = 0; i < pts.length; i++) {
     const a = pts[i], b = pts[(i + 1) % pts.length];
     area += a[0] * b[1] - b[0] * a[1];
   }
-  const dir = area > 0 ? -1 : 1; // outward normal sign
+  const dir = (area > 0 ? 1 : -1) * (invert ? -1 : 1);
   let path = '';
   let started = false;
   for (let i = 0; i < pts.length; i++) {
@@ -337,6 +343,7 @@ function styleOf(spec) {
     fontSize: spec.fontSize || 10,
     fill: spec.fill ?? null,
     opacity: spec.opacity ?? 1,
+    align: spec.align || 'left',
   };
 }
 
@@ -358,10 +365,11 @@ async function buildAppearance(doc, spec, geom) {
   switch (spec.kind) {
     case 'FreeText':
     case 'FreeTextCallout': {
-      await needFont(false);
+      const tf = await needFont(false);
       const [bx0, by0, bx1, by1] = geom.box;
       content = textBoxContent({
-        w, h, lines: geom.lines, fontSize: s.fontSize, color: s.color, fill: s.fill, border: s.lineWidth,
+        w, h, lines: geom.lines, widths: geom.lines.map((l) => tf.widthOfTextAtSize(l, s.fontSize)), align: s.align,
+        fontSize: s.fontSize, color: s.color, fill: s.fill, border: s.lineWidth,
         boxX: bx0 - x0, boxY: by0 - y0, boxW: bx1 - bx0, boxH: by1 - by0,
       });
       if (spec.kind === 'FreeTextCallout' && geom.cl) {
@@ -393,7 +401,7 @@ async function buildAppearance(doc, spec, geom) {
     }
     case 'PolygonCloud': {
       const pts = spec.points.map(local);
-      content = `q ${rg(s.color)} RG ${N(s.lineWidth)} w 1 j\n${cloudPath(pts, geom.arc)}S\nQ\n`;
+      content = `q ${rg(s.color)} RG ${N(s.lineWidth)} w 1 j\n${cloudPath(pts, geom.arc, !!spec.invert)}S\nQ\n`;
       break;
     }
     case 'Highlight':
@@ -485,9 +493,9 @@ async function geometryFor(doc, spec) {
     case 'Circle':
       return { rect: spec.rect };
     case 'PolygonCloud': {
-      const arc = Math.max(10, s.lineWidth * 5);
+      const arc = Math.max(3, spec.arc || Math.max(10, s.lineWidth * 5));
       const [a, b, c, d] = bboxOf(spec.points);
-      const pad = arc * 0.8 + s.lineWidth;
+      const pad = (spec.invert ? 0.5 : arc * 0.8) + s.lineWidth;
       return { rect: [a - pad, b - pad, c + pad, d + pad], arc };
     }
     case 'Highlight':
@@ -534,9 +542,9 @@ function annotDict(doc, page, spec, geom, apRef) {
     case 'FreeText':
     case 'FreeTextCallout': {
       d.DA = PDFString.of(`${rg(s.color)} rg /Helvetica ${N(s.fontSize)} Tf`);
-      d.DS = PDFString.of(`font: Helvetica ${N(s.fontSize)}pt; text-align: left; text-vertical-align: top; color: ${s.color}`);
+      d.DS = PDFString.of(`font: Helvetica ${N(s.fontSize)}pt; text-align: ${s.align}; text-vertical-align: top; color: ${s.color}`);
       d.BS = { W: s.lineWidth };
-      d.Q = 0;
+      d.Q = { left: 0, center: 1, right: 2 }[s.align] ?? 0;
       if (s.fill) d.C = rgbArr(s.fill);
       if (kind === 'FreeTextCallout') {
         d.IT = 'FreeTextCallout';
@@ -563,8 +571,10 @@ function annotDict(doc, page, spec, geom, apRef) {
       d.C = rgbArr(s.color);
       d.Vertices = spec.points.flat();
       d.BS = { W: s.lineWidth };
-      d.BE = { S: 'C', I: 2 };
+      d.BE = { S: 'C', I: geom.arc <= 8 ? 1 : 2 };
       d.IT = 'PolygonCloud';
+      // exact scallop size / direction (viewers that re-draw clouds use /BE /I)
+      d.SCHCloud = { Arc: geom.arc, Invert: !!spec.invert };
       break;
     case 'Highlight':
     case 'Underline':
@@ -682,7 +692,17 @@ async function specFromDict(doc, dict) {
     const le = get(doc, dict, 'LE');
     if (le instanceof PDFArray) spec.ends = le.asArray().map((x) => lookup(doc, x).decodeText());
   }
+  const qv = getNum(doc, dict, 'Q');
+  spec.align = qv === 1 ? 'center' : qv === 2 ? 'right' : 'left';
   if (kind === 'PolygonCloud') {
+    const sch = get(doc, dict, 'SCHCloud');
+    if (sch instanceof PDFDict) {
+      spec.arc = getNum(doc, sch, 'Arc');
+      spec.invert = get(doc, sch, 'Invert')?.toString() === 'true';
+    } else {
+      const beD = get(doc, dict, 'BE');
+      spec.arc = beD instanceof PDFDict && getNum(doc, beD, 'I') === 1 ? 6 : 10;
+    }
     const v = getNums(doc, dict, 'Vertices') || [];
     spec.points = [];
     for (let i = 0; i + 1 < v.length; i += 2) spec.points.push([v[i], v[i + 1]]);
@@ -728,7 +748,8 @@ export async function restyleMarkup(doc, key, patch) {
   if (kind === 'FreeText' || kind === 'FreeTextCallout') {
     dict.set(PDFName.of('Contents'), textObj(next.text || ''));
     dict.set(PDFName.of('DA'), PDFString.of(`${rg(s.color)} rg /Helvetica ${N(s.fontSize)} Tf`));
-    dict.set(PDFName.of('DS'), PDFString.of(`font: Helvetica ${N(s.fontSize)}pt; text-align: left; text-vertical-align: top; color: ${s.color}`));
+    dict.set(PDFName.of('DS'), PDFString.of(`font: Helvetica ${N(s.fontSize)}pt; text-align: ${s.align}; text-vertical-align: top; color: ${s.color}`));
+    dict.set(PDFName.of('Q'), PDFNumber.of({ left: 0, center: 1, right: 2 }[s.align] ?? 0));
     dict.set(PDFName.of('BS'), doc.context.obj({ W: s.lineWidth }));
     if (s.fill) dict.set(PDFName.of('C'), doc.context.obj(rgbArr(s.fill))); else dict.delete(PDFName.of('C'));
     if (kind === 'FreeTextCallout' && geom.cl) { dict.set(PDFName.of('CL'), doc.context.obj(geom.cl)); dict.set(PDFName.of('RD'), doc.context.obj(geom.rd)); }
@@ -737,6 +758,11 @@ export async function restyleMarkup(doc, key, patch) {
     if (kind === 'Square' || kind === 'Circle') { if (s.fill) dict.set(PDFName.of('IC'), doc.context.obj(rgbArr(s.fill))); else dict.delete(PDFName.of('IC')); }
     if (['Line', 'LineArrow', 'Square', 'Circle', 'PolygonCloud', 'Ink'].includes(kind)) dict.set(PDFName.of('BS'), doc.context.obj({ W: s.lineWidth }));
     if (kind === 'Line' || kind === 'LineArrow') dict.set(PDFName.of('L'), doc.context.obj([...next.p1, ...next.p2]));
+    if (kind === 'PolygonCloud') {
+      dict.set(PDFName.of('Vertices'), doc.context.obj(next.points.flat()));
+      dict.set(PDFName.of('BE'), doc.context.obj({ S: 'C', I: geom.arc <= 8 ? 1 : 2 }));
+      dict.set(PDFName.of('SCHCloud'), doc.context.obj({ Arc: geom.arc, Invert: !!next.invert }));
+    }
     if (next.text !== undefined && kind === 'Text') dict.set(PDFName.of('Contents'), textObj(next.text));
     if (s.opacity < 1) dict.set(PDFName.of('CA'), PDFNumber.of(s.opacity));
   }

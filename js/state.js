@@ -24,7 +24,7 @@ export const state = {
   // Phase 5: markups (annotations)
   markups: [],               // every markup in the document (see markups.js readMarkups)
   markupTool: 'select',      // which markup tool is active while activeTool === 'markup'
-  markupStyle: { color: null, lineWidth: null, fontSize: 10, fill: 'auto' }, // null = the tool's own default
+  markupStyle: { color: null, lineWidth: null, fontSize: 10, fill: 'auto', align: 'left', arc: null, invert: false }, // null = the tool's own default
   stampKey: 'Draft',
   selectedMarkup: null,      // ref key of the selected markup
   markupDraft: null,         // in-progress markup awaiting text / a leader point
@@ -33,8 +33,9 @@ export const state = {
   markupAuthor: null,        // name written into new markups
 
   // Phase 2 interactive tool state
-  textEdit: null,      // { pageIndex, rect, text, fontFamily, fontSize, color, bold, italic, underline }
-  redactDraft: null,   // { pageIndex, rect } — drawn, awaiting confirm
+  textEdits: [],       // open text edits: { id, pageIndex, rect, text (original), draft (typed), fontFamily, fontSize, color, bold, italic, underline }
+  activeTextEdit: null, // id of the edit whose style the panel shows
+  redactMarks: [],     // [{ pageIndex, rect }] — areas marked for redaction, applied together on confirm
   redactFill: 'match', // 'match' = blend into the page background (default) | 'black' | 'custom'
   redactColor: '#111111', // used when redactFill is 'custom'
   selectedImage: null, // { pageIndex, rect } — image tool selection

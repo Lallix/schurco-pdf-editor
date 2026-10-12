@@ -6,7 +6,7 @@ let lastSignature = null;
 export function renderPropertiesPanel(container, state, actions) {
   const signature = JSON.stringify([
     state.isLoaded, state.selectedPageIndex, state.docRevision, state.activeTool,
-    state.textEdit, state.redactColor, state.redactFill, state.selectedImage,
+    state.textEdits.map((e) => [e.id, e.fontFamily, e.fontSize, e.color, e.bold, e.italic, e.underline]), state.activeTextEdit, state.redactColor, state.redactFill, state.redactMarks.length, state.selectedImage,
     state.activeTool === 'markup' ? [state.markupTool, state.selectedMarkup, state.markupStyle, state.stampKey, state.markupListOpen, state.markupFilter.type, state.markupFilter.author, state.markups.length, state.markupAuthor] : null,
   ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
@@ -29,7 +29,7 @@ export function renderPropertiesPanel(container, state, actions) {
 }
 
 function renderTextPanel(container, state, actions) {
-  const te = state.textEdit;
+  const te = state.textEdits.find((e) => e.id === state.activeTextEdit) || null;
   if (!te) {
     container.innerHTML = `
       <span class="panel-section-title">Text properties</span>
@@ -67,7 +67,7 @@ function renderTextPanel(container, state, actions) {
       <button class="style-btn ${te.underline ? 'active' : ''}" data-role="underline" aria-label="Underline" aria-pressed="${te.underline}"><span style="text-decoration:underline;">U</span></button>
     </div>
 
-    <span class="field-hint">Editing “${te.text.length > 40 ? te.text.slice(0, 40) + '…' : te.text}” on page ${te.pageIndex + 1}. Press Enter to apply, Esc to cancel.</span>
+    <span class="field-hint">Editing “${te.text.length > 40 ? te.text.slice(0, 40) + '…' : te.text}” on page ${te.pageIndex + 1}. Click other text to edit several at once — Enter applies them all, Esc cancels. Font, size and colour apply to the edit you're typing in.</span>
   `;
 
   container.querySelector('[data-role="font"]').addEventListener('change', (e) => actions.onTextStyleChange({ fontFamily: e.target.value }));
@@ -86,7 +86,14 @@ function renderRedactPanel(container, state, actions) {
   ];
   container.innerHTML = `
     <span class="panel-section-title">Redaction</span>
-    <span class="panel-empty">Drag a box over anything on the page you want gone. It's permanently removed from the file — not just covered — once you export, so this can't be undone by re-opening the PDF elsewhere.</span>
+    <span class="panel-empty">Drag boxes over anything on the page you want gone — mark as many as you like (also across pages), then click <strong>Redact all</strong>. It's permanently removed from the file — not just covered — once you export, so this can't be undone by re-opening the PDF elsewhere.</span>
+
+    ${state.redactMarks.length ? `
+      <div class="ocr-card">
+        <div class="ocr-card-header"><span>${state.redactMarks.length} area${state.redactMarks.length === 1 ? '' : 's'} marked</span></div>
+        <button class="ocr-run-btn" data-role="redact-all" style="background:#C0453A;">Redact ${state.redactMarks.length > 1 ? 'all' : ''}</button>
+        <button class="btn-secondary" data-role="redact-clear" style="height:30px;font-size:12px;">Clear marks</button>
+      </div>` : ''}
 
     <div class="field">
       <span class="field-label">Fill</span>
@@ -111,6 +118,8 @@ function renderRedactPanel(container, state, actions) {
     btn.addEventListener('click', () => actions.onRedactFillChange(btn.dataset.fill));
   });
   container.querySelector('[data-role="color"]')?.addEventListener('input', (e) => actions.onRedactColorChange(e.target.value));
+  container.querySelector('[data-role="redact-all"]')?.addEventListener('click', () => actions.onConfirmRedaction());
+  container.querySelector('[data-role="redact-clear"]')?.addEventListener('click', () => actions.onCancelRedaction());
 }
 
 function renderImagePanel(container, state, actions) {

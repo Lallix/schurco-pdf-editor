@@ -31,8 +31,7 @@ let renderGeneration = 0;
 // global state so keystrokes never trigger a re-render (which would rebuild
 // the textarea and drop focus/cursor position) — only style changes from the
 // properties panel do that, and those are infrequent discrete clicks.
-let draftText = null;
-let lastTextEditKey = null;
+let seenTextEditIds = new Set(); // edits that already had their editor built (so only a *new* one grabs focus)
 
 // One-shot hints consumed by the next render so zoom/page changes land
 // where the user expects instead of snapping back to the top-left.
@@ -100,20 +99,15 @@ function screenRectToPdf(viewport, left, top, width, height) {
 export async function renderCanvas(container, state, actions) {
   const signature = JSON.stringify([
     state.isLoaded, state.selectedPageIndex, state.zoom, state.docRevision, state.activeTool,
-    state.textEdit ? { r: state.textEdit.rect, s: state.textEdit.fontFamily, sz: state.textEdit.fontSize, c: state.textEdit.color, b: state.textEdit.bold, i: state.textEdit.italic, u: state.textEdit.underline } : null,
-    state.redactDraft, state.redactFill, state.redactColor, state.selectedImage, state.cropDraft,
-    state.markupTool, state.selectedMarkup, state.markupDraft, state.markupListOpen, state.markupStyle.color, state.markupStyle.lineWidth, state.markupStyle.fontSize,
+    state.textEdits.map((e) => [e.id, e.rect, e.fontFamily, e.fontSize, e.color, e.bold, e.italic, e.underline]),
+    state.redactMarks, state.redactFill, state.redactColor, state.selectedImage, state.cropDraft,
+    state.markupTool, state.selectedMarkup, state.markupDraft, state.markupListOpen, state.markupStyle.color, state.markupStyle.lineWidth, state.markupStyle.fontSize, state.markupStyle.arc, state.markupStyle.invert, state.markupStyle.align,
     container.offsetWidth, container.offsetHeight,
   ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
   lastSignature = signature;
   container.dataset.rendered = '1';
   const myGeneration = ++renderGeneration;
-
-  const textEditKey = state.textEdit ? `${state.textEdit.pageIndex}:${state.textEdit.rect.x}:${state.textEdit.rect.y}` : null;
-  const isNewTextEdit = textEditKey !== lastTextEditKey;
-  lastTextEditKey = textEditKey;
-  if (!state.textEdit) draftText = null;
 
   if (!state.isLoaded) {
     lastRenderedLoaded = false;
@@ -232,7 +226,7 @@ export async function renderCanvas(container, state, actions) {
   wrap.style.width = `${viewport.width}px`;
   wrap.style.height = `${viewport.height}px`;
 
-  const textRuns = (state.activeTool === 'text' && !state.textEdit) ? await engine.getTextRuns(idx) : null;
+  const textRuns = state.activeTool === 'text' ? await engine.getTextRuns(idx) : null;
   if (myGeneration !== renderGeneration) return;
 
   // The selectable text layer serves the Select tool and the text-markup tools.
@@ -246,7 +240,7 @@ export async function renderCanvas(container, state, actions) {
   }
 
   wireToolInteractions(hit, overlays, idx, viewport, state, actions, layer);
-  renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns);
+  renderOverlays(overlays, idx, viewport, state, actions, textRuns);
   ensurePainted(container, idx, viewport, state.docRevision);
 }
 
@@ -306,7 +300,9 @@ async function buildTextLayer(layer, idx, viewport, generation) {
     const span = document.createElement('span');
     span.textContent = item.str;
     span.style.cssText = `left:${tx[4] + ascent * Math.sin(angle)}px;top:${tx[5] - ascent * Math.cos(angle)}px;font-size:${fh}px;font-family:${style.fontFamily || 'sans-serif'};`;
-    spans.push({ span, angle, target: item.width * viewport.scale });
+    const target = item.width * viewport.scale;
+    span._g = { x0: tx[4], x1: tx[4] + target * Math.cos(angle), base: tx[5], fs: fh, angle };
+    spans.push({ span, angle, target });
     layer.appendChild(span);
     // Line breaks, so copied text keeps its lines instead of running together.
     if (item.hasEOL) layer.appendChild(document.createElement('br'));
@@ -318,6 +314,51 @@ async function buildTextLayer(layer, idx, viewport, generation) {
     const k = widths[i] > 0 && s.target > 0 ? Math.min(6, Math.max(0.15, s.target / widths[i])) : 1;
     s.span.style.transform = `rotate(${s.angle}rad) scaleX(${k})`;
   });
+  guardSelection(layer);
+}
+
+// Keeps a drag-selection to the text you are actually dragging over. The spans
+// are positioned absolutely, so when the pointer is over a gap the browser has
+// no text under it and snaps the selection to the start or end of the whole
+// page ("it jumps to all text"). While dragging, an invisible element covers
+// the layer and is kept right next to the end being moved, so a gap maps to a
+// spot beside the text you were on instead. (The same idea pdf.js uses.)
+function guardSelection(layer) {
+  const end = document.createElement('div');
+  end.className = 'end-of-content';
+  layer.appendChild(end);
+  let prev = null;
+
+  layer.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    // starting a drag in empty space would anchor at the very start of the page's text
+    if (e.target === layer || e.target === end) { e.preventDefault(); window.getSelection()?.removeAllRanges(); return; }
+    layer.classList.add('selecting');
+  });
+
+  const onChange = () => {
+    if (!layer.isConnected) { document.removeEventListener('selectionchange', onChange); return; }
+    if (!layer.classList.contains('selecting')) return;
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const range = sel.getRangeAt(0);
+    // whichever end changed since last time is the one being dragged
+    const modifyStart = !!prev && range.endContainer === prev.endContainer && range.endOffset === prev.endOffset;
+    let node = modifyStart ? range.startContainer : range.endContainer;
+    if (node.nodeType === Node.TEXT_NODE) node = node.parentNode;
+    if (!modifyStart && range.endOffset === 0 && node.previousElementSibling) node = node.previousElementSibling;
+    if (node && node.parentNode === layer) layer.insertBefore(end, modifyStart ? node : node.nextSibling);
+    prev = range.cloneRange();
+  };
+  document.addEventListener('selectionchange', onChange);
+
+  const onUp = () => {
+    if (!layer.isConnected) { document.removeEventListener('mouseup', onUp); return; }
+    layer.classList.remove('selecting');
+    layer.appendChild(end);
+    prev = null;
+  };
+  document.addEventListener('mouseup', onUp);
 }
 
 function wireToolInteractions(hit, overlays, idx, viewport, state, actions, textLayerEl) {
@@ -392,7 +433,7 @@ function wireToolInteractions(hit, overlays, idx, viewport, state, actions, text
   }
 }
 
-function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns) {
+function renderOverlays(overlays, idx, viewport, state, actions, textRuns) {
   overlays.innerHTML = '';
   if (state.activeTool === 'markup') renderMarkupOverlays(overlays, idx, viewport, state, actions);
 
@@ -403,101 +444,124 @@ function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, 
   overlays.appendChild(clip);
 
   // --- Edit Text: dim the page and highlight only the editable runs, so it's
-  // obvious what can be clicked instead of hunting for it with a crosshair.
-  if (textRuns && state.activeTool === 'text') {
+  // obvious what can be clicked. Runs stay clickable while others are open, so
+  // any number can be edited together and applied in one go.
+  if (state.activeTool === 'text') {
     const scrim = document.createElement('div');
     scrim.style.cssText = 'position:absolute;inset:0;background:rgba(21,24,26,0.45);pointer-events:none;';
     clip.appendChild(scrim);
 
-    for (const run of textRuns) {
+    const open = state.textEdits.filter((e) => e.pageIndex === idx);
+    const isOpen = (run) => open.some((e) => e.rect.x === run.rect.x && e.rect.y === run.rect.y);
+    for (const run of textRuns || []) {
+      if (isOpen(run)) continue; // its editor takes the place of the highlight
       const screen = pdfRectToScreen(viewport, run.rect);
       const pad = 3;
       const box = document.createElement('button');
       box.type = 'button';
       box.setAttribute('aria-label', `Edit text: ${run.text}`);
-      box.style.cssText = `position:absolute;left:${screen.left - pad}px;top:${screen.top - pad}px;width:${screen.width + pad * 2}px;height:${screen.height + pad * 2}px;background:rgba(255,255,255,0.96);border:1.5px solid var(--accent);border-radius:3px;padding:0;cursor:pointer;pointer-events:auto;`;
+      box.style.cssText = `position:absolute;left:${screen.left - pad}px;top:${screen.top - pad}px;width:${screen.width + pad * 2}px;height:${screen.height + pad * 2}px;background:rgba(255,255,255,0.96);border:1.5px solid var(--accent);border-radius:3px;padding:0;cursor:pointer;pointer-events:auto;z-index:3;`;
       box.addEventListener('click', () => actions.onStartTextEdit(idx, run));
       overlays.appendChild(box);
     }
-  }
 
-  if (state.textEdit && state.textEdit.pageIndex === idx) {
-    // Keep the page dimmed behind the single active edit too, for visual
-    // consistency with the browsing view above.
-    const scrim = document.createElement('div');
-    scrim.style.cssText = 'position:absolute;inset:0;background:rgba(21,24,26,0.45);pointer-events:none;';
-    clip.appendChild(scrim);
-
-    const te = state.textEdit;
-    if (isNewTextEdit || draftText === null) draftText = te.text;
-    const screen = pdfRectToScreen(viewport, te.rect);
-    // Sized generously (not just the original run's tight box) since the new
-    // text, font or size may not match the original glyphs' footprint —
-    // a single-line input, since a text run is never a wrapped paragraph.
-    const boxWidth = Math.max(screen.width * 1.6, 160);
-    const boxHeight = Math.max(screen.height, te.fontSize * viewport.scale * 1.4);
-    const box = document.createElement('div');
-    box.style.cssText = `position:absolute;left:${screen.left}px;top:${screen.top}px;width:${boxWidth}px;height:${boxHeight}px;pointer-events:auto;`;
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.value = draftText;
-    input.style.cssText = `width:100%;height:100%;border:1.5px solid var(--accent);border-radius:3px;padding:0 2px;margin:0;box-sizing:border-box;background:#fff;outline:none;${cssFontString(te, viewport.scale)}`;
-    input.addEventListener('input', () => { draftText = input.value; });
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      // Escape is handled globally (see app.js) to fully exit the Edit Text
-      // tool — just prevent any native input behaviour here and let it bubble.
-      if (e.key === 'Escape') { e.preventDefault(); }
-    });
-    box.appendChild(input);
-
-    const toolbar = document.createElement('div');
-    const below = screen.top + boxHeight + 34 < overlays.clientHeight;
-    toolbar.style.cssText = `position:absolute;left:${screen.left}px;top:${below ? screen.top + boxHeight + 6 : Math.max(0, screen.top - 40)}px;display:flex;gap:6px;pointer-events:auto;`;
-    toolbar.innerHTML = `
-      <button class="btn-primary" style="height:28px;padding:0 12px;font-size:11.5px;" data-role="commit">Apply</button>
-      <button class="btn-secondary" style="height:28px;padding:0 12px;font-size:11.5px;" data-role="cancel">Cancel</button>
-    `;
-    overlays.appendChild(box);
-    overlays.appendChild(toolbar);
-
-    function commit() {
-      const text = draftText;
-      draftText = null;
-      actions.onCommitTextEdit(te.pageIndex, te.rect, te.text, text, {
-        fontFamily: te.fontFamily, fontSize: te.fontSize, color: te.color, bold: te.bold, italic: te.italic, underline: te.underline,
+    // one editor per open edit
+    let focusEl = null;
+    let focusSelect = false;
+    for (const te of open) {
+      const isNew = !seenTextEditIds.has(te.id);
+      const screen = pdfRectToScreen(viewport, te.rect);
+      // Sized generously (not just the original run's tight box) since the new
+      // text, font or size may not match the original glyphs' footprint —
+      // a single-line input, since a text run is never a wrapped paragraph.
+      // The box matches the run's own footprint so it never covers the text
+      // next to it (which must stay clickable); the input widens only while
+      // you are typing in it (see .te-input:focus).
+      const boxWidth = Math.max(screen.width + 6, 48);
+      // (the run's box carries slack above and below the glyphs; trim it so
+      // neighbouring lines' boxes aren't covered)
+      const boxHeight = Math.max(screen.height * 0.82, 16);
+      const box = document.createElement('div');
+      box.style.cssText = `position:absolute;left:${screen.left - 3}px;top:${screen.top + screen.height * 0.1}px;width:${boxWidth}px;height:${boxHeight}px;pointer-events:auto;z-index:2;`;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'te-input';
+      input.value = te.draft;
+      input.style.cssText = `width:100%;height:100%;border:1.5px solid var(--accent);border-radius:3px;padding:0 2px;margin:0;box-sizing:border-box;background:#fff;outline:none;${cssFontString(te, viewport.scale)}`;
+      input.addEventListener('input', () => { te.draft = input.value; });
+      input.addEventListener('focus', () => actions.onFocusTextEdit(te.id));
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); actions.onCommitTextEdits(); }
+        // Escape is handled globally (see app.js): the first one drops the open edits.
+        if (e.key === 'Escape') { e.preventDefault(); }
       });
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.title = 'Discard this edit';
+      x.setAttribute('aria-label', 'Discard this edit');
+      x.textContent = '×';
+      x.style.cssText = 'position:absolute;right:-9px;top:-9px;width:18px;height:18px;border-radius:50%;border:none;background:var(--dark);color:#fff;font-size:13px;line-height:16px;padding:0;cursor:pointer;';
+      x.addEventListener('click', (e) => { e.stopPropagation(); actions.onRemoveTextEdit(te.id); });
+      box.append(input, x);
+      overlays.appendChild(box);
+      if (isNew) { focusEl = input; focusSelect = true; } else if (te.id === state.activeTextEdit && !focusEl) { focusEl = input; }
     }
-    function cancel() {
-      draftText = null;
-      actions.onCancelTextEdit();
+    seenTextEditIds = new Set(state.textEdits.map((e) => e.id));
+    if (focusEl) setTimeout(() => { focusEl.focus(); if (focusSelect) focusEl.select(); }, 0);
+
+    // one bar applies them all
+    if (state.textEdits.length) {
+      const n = state.textEdits.length;
+      const bar = document.createElement('div');
+      bar.style.cssText = 'position:absolute;left:12px;top:12px;display:flex;gap:8px;align-items:center;background:var(--dark);padding:8px 10px;border-radius:10px;pointer-events:auto;box-shadow:0 8px 20px rgba(20,22,20,0.25);white-space:nowrap;z-index:6;';
+      bar.innerHTML = `
+        <span style="color:#fff;font-size:11.5px;">${n} edit${n === 1 ? '' : 's'} open — click more text to edit it too</span>
+        <button class="btn-primary" style="height:26px;padding:0 10px;font-size:11px;" data-role="commit">Apply ${n > 1 ? 'all' : ''}</button>
+        <button class="btn-secondary" style="height:26px;padding:0 10px;font-size:11px;" data-role="cancel">Cancel</button>`;
+      overlays.appendChild(bar);
+      bar.querySelector('[data-role="commit"]').addEventListener('click', () => actions.onCommitTextEdits());
+      bar.querySelector('[data-role="cancel"]').addEventListener('click', () => actions.onCancelTextEdit());
     }
-    toolbar.querySelector('[data-role="commit"]').addEventListener('click', commit);
-    toolbar.querySelector('[data-role="cancel"]').addEventListener('click', cancel);
-    setTimeout(() => { input.focus(); input.select(); }, 0);
   }
 
-  if (state.redactDraft && state.redactDraft.pageIndex === idx) {
-    const screen = pdfRectToScreen(viewport, state.redactDraft.rect);
-    const box = document.createElement('div');
+  // Areas marked for redaction: every box stays until you apply or clear them all.
+  if (state.redactMarks.length) {
     // "Match page" can't be previewed exactly (the colour is sampled when you
-    // confirm), so it's shown as a marked-up region; black/custom show the real fill.
+    // apply), so it's shown as a marked-up region; black/custom show the real fill.
     const fillCss = state.redactFill === 'black' ? '#000'
       : state.redactFill === 'custom' ? state.redactColor
       : 'rgba(192,69,58,0.2)';
-    const border = state.redactFill === 'match' ? '2px dashed #C0453A' : 'none';
-    box.style.cssText = `position:absolute;left:${screen.left}px;top:${screen.top}px;width:${screen.width}px;height:${screen.height}px;background:${fillCss};border:${border};box-sizing:border-box;pointer-events:none;`;
-    overlays.appendChild(box);
-
+    const border = state.redactFill === 'match' ? '2px dashed #C0453A' : '1px solid rgba(192,69,58,0.8)';
+    let lastScreen = null;
+    state.redactMarks.forEach((mark, i) => {
+      if (mark.pageIndex !== idx) return;
+      const screen = pdfRectToScreen(viewport, mark.rect);
+      lastScreen = screen;
+      const box = document.createElement('div');
+      box.style.cssText = `position:absolute;left:${screen.left}px;top:${screen.top}px;width:${screen.width}px;height:${screen.height}px;background:${fillCss};border:${border};box-sizing:border-box;pointer-events:none;`;
+      overlays.appendChild(box);
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.title = 'Remove this mark';
+      x.setAttribute('aria-label', 'Remove this mark');
+      x.textContent = '×';
+      x.style.cssText = `position:absolute;left:${screen.left + screen.width - 9}px;top:${screen.top - 9}px;width:18px;height:18px;border-radius:50%;border:none;background:var(--dark);color:#fff;font-size:13px;line-height:16px;padding:0;cursor:pointer;pointer-events:auto;z-index:5;`;
+      x.addEventListener('click', (e) => { e.stopPropagation(); actions.onRemoveRedactMark(i); });
+      overlays.appendChild(x);
+    });
+    // the apply bar sits by the most recent box on this page, or at the top if the marks are elsewhere
+    const n = state.redactMarks.length;
+    const here = state.redactMarks.filter((m) => m.pageIndex === idx).length;
+    const anchor = lastScreen || { left: 12, top: 12, width: 0, height: 0 };
     const pill = document.createElement('div');
-    pill.style.cssText = `position:absolute;left:${screen.left}px;top:${pillTop(overlays, screen)}px;display:flex;gap:8px;align-items:center;background:var(--dark);padding:8px 10px;border-radius:10px;pointer-events:auto;box-shadow:0 8px 20px rgba(20,22,20,0.25);white-space:nowrap;`;
+    pill.style.cssText = `position:absolute;left:${anchor.left}px;top:${lastScreen ? pillTop(overlays, anchor) : 12}px;display:flex;gap:8px;align-items:center;background:var(--dark);padding:8px 10px;border-radius:10px;pointer-events:auto;box-shadow:0 8px 20px rgba(20,22,20,0.25);white-space:nowrap;z-index:6;`;
     pill.innerHTML = `
-      <span style="color:#fff;font-size:11.5px;">Permanently remove this area?</span>
-      <button class="btn-primary" style="height:26px;padding:0 10px;font-size:11px;background:#C0453A;" data-role="confirm">Redact</button>
-      <button class="btn-secondary" style="height:26px;padding:0 10px;font-size:11px;" data-role="cancel">Cancel</button>
+      <span style="color:#fff;font-size:11.5px;">${n} area${n === 1 ? '' : 's'} marked${n !== here ? ` (${here} on this page)` : ''} — remove permanently?</span>
+      <button class="btn-primary" style="height:26px;padding:0 10px;font-size:11px;background:#C0453A;" data-role="confirm">Redact ${n > 1 ? 'all' : ''}</button>
+      <button class="btn-secondary" style="height:26px;padding:0 10px;font-size:11px;" data-role="cancel">Clear</button>
     `;
     overlays.appendChild(pill);
-    pill.querySelector('[data-role="confirm"]').addEventListener('click', () => actions.onConfirmRedaction(idx, state.redactDraft.rect));
+    pill.querySelector('[data-role="confirm"]').addEventListener('click', () => actions.onConfirmRedaction());
     pill.querySelector('[data-role="cancel"]').addEventListener('click', () => actions.onCancelRedaction());
   }
 

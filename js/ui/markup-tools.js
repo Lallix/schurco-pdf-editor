@@ -80,6 +80,9 @@ function snap45(p1, p2) {
 }
 
 // Selected text -> quads (PDF space) for highlight / underline / strikethrough.
+// Built from each text item's own geometry (its baseline and font size), not
+// from the browser's line boxes — those are taller than the glyphs and sit
+// lower, which is what made highlights and strikethroughs look off-centre.
 export function quadsFromSelection(layer, viewport) {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return [];
@@ -87,13 +90,36 @@ export function quadsFromSelection(layer, viewport) {
   if (!layer.contains(range.commonAncestorContainer)) return [];
   const base = layer.getBoundingClientRect();
   const quads = [];
-  for (const r of range.getClientRects()) {
-    if (r.width < 1 || r.height < 1) continue;
-    const l = r.left - base.left, t = r.top - base.top;
-    const [x0, y0] = viewport.convertToPdfPoint(l, t);
-    const [x1, y1] = viewport.convertToPdfPoint(l + r.width, t + r.height);
-    const left = Math.min(x0, x1), right = Math.max(x0, x1), bottom = Math.min(y0, y1), top = Math.max(y0, y1);
-    quads.push([left, top, right, top, left, bottom, right, bottom]);
+  const pdf = (x, y) => viewport.convertToPdfPoint(x, y);
+  for (const span of layer.querySelectorAll('span')) {
+    if (!range.intersectsNode(span)) continue;
+    const g = span._g;
+    const text = span.firstChild;
+    let x0 = g ? g.x0 : 0, x1 = g ? g.x1 : 0;
+    // a span only partly inside the selection: take just the selected stretch
+    const partialStart = text && range.startContainer === text && range.startOffset > 0;
+    const partialEnd = text && range.endContainer === text && range.endOffset < text.length;
+    if (!g || partialStart || partialEnd) {
+      const sub = document.createRange();
+      sub.selectNodeContents(span);
+      if (partialStart) sub.setStart(range.startContainer, range.startOffset);
+      if (partialEnd) sub.setEnd(range.endContainer, range.endOffset);
+      const r = sub.getBoundingClientRect();
+      x0 = r.left - base.left;
+      x1 = r.right - base.left;
+      if (!g) { // no geometry recorded: fall back to the box the browser reports
+        if (r.width < 1 || r.height < 1) continue;
+        const T = pdf(x0, r.top - base.top), B = pdf(x1, r.bottom - base.top);
+        const L = Math.min(T[0], B[0]), R = Math.max(T[0], B[0]), lo = Math.min(T[1], B[1]), hi = Math.max(T[1], B[1]);
+        quads.push([L, hi, R, hi, L, lo, R, lo]);
+        continue;
+      }
+    }
+    if (x1 - x0 < 0.5) continue;
+    // ascender-to-descender box around the baseline (cap height ~0.8, descender ~0.22)
+    const top = g.base - 0.8 * g.fs, bottom = g.base + 0.22 * g.fs;
+    const tl = pdf(x0, top), tr = pdf(x1, top), bl = pdf(x0, bottom), br = pdf(x1, bottom);
+    quads.push([tl[0], tl[1], tr[0], tr[1], bl[0], bl[1], br[0], br[1]]);
   }
   return quads;
 }
@@ -237,20 +263,103 @@ export function wireMarkupCreate(hit, overlays, idx, viewport, state, actions, t
   });
 }
 
+// Scalloped cloud outline as an SVG path (same geometry as the one written to
+// the PDF, so what you see while drawing is what you get).
+function scallopPath(pts, arc, invert) {
+  let area = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    area += a[0] * b[1] - b[0] * a[1];
+  }
+  const dir = (area > 0 ? 1 : -1) * (invert ? -1 : 1);
+  let d = '';
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i + 1) % pts.length];
+    const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    if (len < 0.5) continue;
+    const n = Math.max(1, Math.round(len / arc));
+    const nx = dir * (q[1] - p[1]) / len, ny = dir * -(q[0] - p[0]) / len;
+    for (let k = 0; k < n; k++) {
+      const a = [p[0] + (q[0] - p[0]) * k / n, p[1] + (q[1] - p[1]) * k / n];
+      const b = [p[0] + (q[0] - p[0]) * (k + 1) / n, p[1] + (q[1] - p[1]) * (k + 1) / n];
+      const off = (len / n) * 0.667;
+      if (!d) d = `M${a[0]},${a[1]} `;
+      d += `C${a[0] + nx * off},${a[1] + ny * off} ${b[0] + nx * off},${b[1] + ny * off} ${b[0]},${b[1]} `;
+    }
+  }
+  return d + 'Z';
+}
+
 function wireCloud(hit, overlays, idx, viewport, state, actions, local, toPdf, color, lw) {
-  const svg = svgEl('svg', { style: 'position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;' });
-  const line = svgEl('polyline', { fill: 'rgba(228,66,52,0.06)', stroke: color, 'stroke-width': lw, 'stroke-dasharray': '6 4' });
-  svg.appendChild(line);
-  overlays.appendChild(svg);
+  const arcPx = Math.max(4, (state.markupStyle.arc || 10) * viewport.scale);
+  const invert = !!state.markupStyle.invert;
   const pts = cloudPoints && cloudPoints.page === idx ? cloudPoints.pts : [];
   cloudPoints = { page: idx, pts };
-  const draw = (cursor) => {
-    const all = cursor ? [...pts, cursor] : pts;
-    line.setAttribute('points', all.map((p) => p.join(',')).join(' '));
+
+  const svg = svgEl('svg', { style: 'position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none;' });
+  const shape = svgEl('path', { fill: 'rgba(228,66,52,0.06)', stroke: color, 'stroke-width': lw, 'stroke-linejoin': 'round' });
+  const guide = svgEl('polyline', { fill: 'none', stroke: color, 'stroke-width': 1, 'stroke-dasharray': '4 4', opacity: 0.7 });
+  const dots = svgEl('g');
+  svg.append(shape, guide, dots);
+  const hint = document.createElement('div');
+  hint.style.cssText = 'position:absolute;left:8px;top:8px;background:var(--dark);color:#fff;font-size:11.5px;padding:6px 10px;border-radius:8px;pointer-events:none;z-index:8;';
+  hint.textContent = 'Cloud: click each corner · double-click or click the first point to finish · drag for a rectangle · Esc to cancel';
+
+  // The page overlay is rebuilt after the tools are wired, so (re)attach whenever we draw.
+  const draw = (cursor, override) => {
+    if (!svg.isConnected) overlays.append(svg, hint);
+    const base = override || pts;
+    const all = cursor && !override ? [...base, cursor] : base;
+    guide.setAttribute('points', all.length > 1 ? [...all, all[0]].map((p) => p.join(',')).join(' ') : '');
+    shape.setAttribute('d', all.length >= 3 ? scallopPath(all, arcPx, invert) : '');
+    dots.replaceChildren();
+    base.forEach((p, i) => {
+      const first = i === 0;
+      const ring = svgEl('circle', { cx: p[0], cy: p[1], r: first && base.length >= 3 ? 8 : 4, fill: first ? '#fff' : color, stroke: first ? '#218240' : '#fff', 'stroke-width': first ? 2.5 : 1.5 });
+      dots.appendChild(ring);
+    });
+    hint.style.display = override ? 'none' : '';
   };
-  draw();
-  hit.addEventListener('mousemove', (e) => { if (pts.length) draw(local(e)); });
+  setTimeout(() => draw(), 0);
+
+  let dragStart = null;
+  let dragging = false;
+  let ignoreClick = false;
+  const rectOf = (a, b) => [[Math.min(a[0], b[0]), Math.min(a[1], b[1])], [Math.max(a[0], b[0]), Math.min(a[1], b[1])],
+    [Math.max(a[0], b[0]), Math.max(a[1], b[1])], [Math.min(a[0], b[0]), Math.max(a[1], b[1])]];
+
+  hit.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || pts.length) return;
+    dragStart = local(e);
+    dragging = false;
+    const onMove = (ev) => {
+      const r = hit.getBoundingClientRect();
+      const cur = [Math.min(Math.max(ev.clientX - r.left, 0), r.width), Math.min(Math.max(ev.clientY - r.top, 0), r.height)];
+      if (!dragging && Math.hypot(cur[0] - dragStart[0], cur[1] - dragStart[1]) < 10) return;
+      dragging = true;
+      draw(null, rectOf(dragStart, cur));
+      dragStart.cur = cur;
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      if (dragging && dragStart.cur) {
+        const corners = rectOf(dragStart, dragStart.cur);
+        ignoreClick = true;
+        setTimeout(() => { ignoreClick = false; }, 50);
+        cloudPoints = null;
+        actions.onCreateMarkup({ kind: 'PolygonCloud', pageIndex: idx, points: corners.map(toPdf) });
+      }
+      dragStart = null;
+      dragging = false;
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  hit.addEventListener('mousemove', (e) => { if (pts.length && !dragging) draw(local(e)); });
   hit.addEventListener('click', (e) => {
+    if (ignoreClick) return;
     const p = local(e);
     if (e.detail >= 2) { finish(); return; } // double-click closes
     if (pts.length >= 3 && Math.hypot(p[0] - pts[0][0], p[1] - pts[0][1]) < 10) { finish(); return; }
@@ -267,8 +376,9 @@ function wireCloud(hit, overlays, idx, viewport, state, actions, local, toPdf, c
   }
   // Enter finishes, Escape abandons
   const key = (e) => {
-    if (!hit.isConnected) { document.removeEventListener('keydown', key); return; }
+    if (!hit.isConnected) { document.removeEventListener('keydown', key, true); return; }
     if (e.key === 'Enter' && pts.length >= 3) { e.preventDefault(); finish(); }
+    if (e.key === 'Backspace' && pts.length) { e.preventDefault(); pts.pop(); draw(); }
     if (e.key === 'Escape' && pts.length) { e.stopPropagation(); cloudPoints = null; pts.length = 0; draw(); }
   };
   document.addEventListener('keydown', key, true);
@@ -454,7 +564,7 @@ function renderDraftEditor(overlays, viewport, state, actions, draft) {
   const ta = document.createElement('textarea');
   ta.value = draftText;
   ta.placeholder = isNote ? 'Write a note…' : 'Type your text…';
-  ta.style.cssText = `width:100%;min-height:${s.height}px;box-sizing:border-box;border:1.5px solid ${color};border-radius:2px;padding:3px;margin:0;background:#fff;outline:none;resize:both;font-family:Helvetica,Arial,sans-serif;font-size:${isNote ? 12 : fs}px;line-height:1.2;color:${color};`;
+  ta.style.cssText = `width:100%;min-height:${s.height}px;box-sizing:border-box;border:1.5px solid ${color};border-radius:2px;padding:3px;margin:0;background:#fff;outline:none;resize:both;font-family:Helvetica,Arial,sans-serif;font-size:${isNote ? 12 : fs}px;line-height:1.2;color:${color};text-align:${state.markupStyle.align || 'left'};`;
   ta.addEventListener('input', () => { draftText = ta.value; });
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); commit(); }
