@@ -1,5 +1,6 @@
 import { engine } from '../pdf-engine.js';
-import { markupBarHtml, wireMarkupBar, wireMarkupCreate, renderMarkupOverlays } from './markup-tools.js';
+import { markupBarHtml, wireMarkupBar, wireMarkupCreate, renderMarkupOverlays, quadsFromSelection } from './markup-tools.js';
+import { wireCropDraw, renderCropOverlay } from './crop-tool.js';
 
 // Zoom is a multiplier on "fit to screen": 100% always means the whole page
 // fits the workspace, whatever the page size or window size.
@@ -101,6 +102,7 @@ export async function renderCanvas(container, state, actions) {
     state.isLoaded, state.selectedPageIndex, state.zoom, state.docRevision, state.activeTool,
     state.textEdits.map((e) => [e.id, e.rect, e.fontFamily, e.fontSize, e.color, e.bold, e.italic, e.underline]),
     state.redactMarks, state.redactFill, state.redactColor, state.selectedImage, state.cropDraft,
+    state.redactMode, state.cropPageDraft,
     state.markupTool, state.selectedMarkup, state.markupDraft, state.markupListOpen, state.markupStyle.color, state.markupStyle.lineWidth, state.markupStyle.fontSize, state.markupStyle.arc, state.markupStyle.invert, state.markupStyle.align,
     container.offsetWidth, container.offsetHeight,
   ]);
@@ -190,6 +192,8 @@ export async function renderCanvas(container, state, actions) {
   // Size everything synchronously from the known page size, so the layout
   // (and therefore scrolling/centring) is correct immediately instead of
   // after the async viewport lookup below.
+  // Edit Text view: dim the page; the clickable runs un-dim themselves (see .te-run).
+  canvas.style.filter = state.activeTool === 'text' ? 'brightness(0.5)' : '';
   canvas.style.width = `${cssW}px`;
   canvas.style.height = `${cssH}px`;
   wrap.style.width = `${cssW}px`;
@@ -231,8 +235,9 @@ export async function renderCanvas(container, state, actions) {
 
   // The selectable text layer serves the Select tool and the text-markup tools.
   const textMarkup = state.activeTool === 'markup' && ['highlight', 'underline', 'strike'].includes(state.markupTool);
+  const textRedact = state.activeTool === 'redact' && state.redactMode === 'text';
   let layer = null;
-  if (state.activeTool === 'select' || textMarkup) {
+  if (state.activeTool === 'select' || textMarkup || textRedact) {
     layer = document.createElement('div');
     layer.className = 'text-layer';
     wrap.insertBefore(layer, overlays);
@@ -364,6 +369,24 @@ function guardSelection(layer) {
 function wireToolInteractions(hit, overlays, idx, viewport, state, actions, textLayerEl) {
   const tool = state.activeTool;
   if (tool === 'markup') { wireMarkupCreate(hit, overlays, idx, viewport, state, actions, textLayerEl); return; }
+  if (tool === 'cropPage') { wireCropDraw(hit, overlays, idx, viewport, state, actions); return; }
+  // Redact by selecting text: each selected stretch becomes a mark.
+  if (tool === 'redact' && state.redactMode === 'text') {
+    hit.style.cursor = 'text';
+    textLayerEl?.addEventListener('mouseup', () => {
+      setTimeout(() => {
+        const quads = quadsFromSelection(textLayerEl, viewport);
+        if (!quads.length) return;
+        window.getSelection().removeAllRanges();
+        actions.onRedactMarksAdd(idx, quads.map((q) => {
+          const xs = [q[0], q[2], q[4], q[6]], ys = [q[1], q[3], q[5], q[7]];
+          const x = Math.min(...xs) - 1, y = Math.min(...ys) - 1;
+          return { x, y, width: Math.max(...xs) + 1 - x, height: Math.max(...ys) + 1 - y };
+        }));
+      }, 0);
+    });
+    return;
+  }
   hit.style.cursor = tool === 'pan' ? 'grab' : tool === 'select' ? 'default' : 'crosshair';
 
   if (tool === 'image') {
@@ -436,6 +459,7 @@ function wireToolInteractions(hit, overlays, idx, viewport, state, actions, text
 function renderOverlays(overlays, idx, viewport, state, actions, textRuns) {
   overlays.innerHTML = '';
   if (state.activeTool === 'markup') renderMarkupOverlays(overlays, idx, viewport, state, actions);
+  if (state.activeTool === 'cropPage') renderCropOverlay(overlays, idx, viewport, state, actions);
 
   // Dimming layers are clipped to the page; everything else may overhang the
   // page edge onto the pasteboard.
@@ -447,9 +471,9 @@ function renderOverlays(overlays, idx, viewport, state, actions, textRuns) {
   // obvious what can be clicked. Runs stay clickable while others are open, so
   // any number can be edited together and applied in one go.
   if (state.activeTool === 'text') {
-    const scrim = document.createElement('div');
-    scrim.style.cssText = 'position:absolute;inset:0;background:rgba(21,24,26,0.45);pointer-events:none;';
-    clip.appendChild(scrim);
+    // (the page itself is dimmed by a filter on the canvas — see renderCanvas — and
+    // each run's box lifts that dimming again, so the text you can click stays
+    // readable instead of being hidden under a white patch)
 
     const open = state.textEdits.filter((e) => e.pageIndex === idx);
     const isOpen = (run) => open.some((e) => e.rect.x === run.rect.x && e.rect.y === run.rect.y);
@@ -460,7 +484,8 @@ function renderOverlays(overlays, idx, viewport, state, actions, textRuns) {
       const box = document.createElement('button');
       box.type = 'button';
       box.setAttribute('aria-label', `Edit text: ${run.text}`);
-      box.style.cssText = `position:absolute;left:${screen.left - pad}px;top:${screen.top - pad}px;width:${screen.width + pad * 2}px;height:${screen.height + pad * 2}px;background:rgba(255,255,255,0.96);border:1.5px solid var(--accent);border-radius:3px;padding:0;cursor:pointer;pointer-events:auto;z-index:3;`;
+      box.className = 'te-run';
+      box.style.cssText = `position:absolute;left:${screen.left - pad}px;top:${screen.top - pad}px;width:${screen.width + pad * 2}px;height:${screen.height + pad * 2}px;border:1.5px solid var(--accent);border-radius:3px;padding:0;cursor:pointer;pointer-events:auto;z-index:3;`;
       box.addEventListener('click', () => actions.onStartTextEdit(idx, run));
       overlays.appendChild(box);
     }

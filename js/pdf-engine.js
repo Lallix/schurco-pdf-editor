@@ -8,6 +8,8 @@ import { OPS } from './vendor/pdf.min.mjs';
 import { PDFDocument, degrees, rgb, StandardFonts } from './vendor/pdf-lib.esm.min.js';
 import Tesseract from './vendor/tesseract/tesseract.esm.min.js';
 import * as markups from './markups.js';
+import * as pagetools from './pagetools.js';
+import { measureSkewDegrees } from './layout.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './js/vendor/pdf.worker.min.mjs';
 
@@ -132,6 +134,8 @@ function dominantColor(data, w, h, include) {
   return { r: best.r / best.n / 255, g: best.g / best.n / 255, b: best.b / best.n / 255 };
 }
 
+const i2 = (index, rect) => ({ index, rect });
+
 function ptToMm(pt) {
   return Math.round(pt * 0.352778);
 }
@@ -200,7 +204,7 @@ class PdfEngine {
   async _snapshot() {
     if (!this.doc) return;
     this.undoStack.push({
-      bytes: await this.doc.save(),
+      bytes: await this._saveDoc(),
       dirtyPages: new Set(this.dirtyPages),
       ocrPages: new Set(this.ocrPages),
       coveredRegions: new Map(Array.from(this.coveredRegions, ([k, v]) => [k, v.slice()])),
@@ -210,9 +214,27 @@ class PdfEngine {
     this.dirty = true;
   }
 
+  // pdf-lib keeps drawing into one cached content stream per page, and once the
+  // document has been saved that stream's bytes are frozen: anything drawn on the
+  // page afterwards is silently dropped from the next save. That made the first
+  // redaction or text edit on a page work and every later one vanish. Saving
+  // through here forgets the cached streams, so the next drawing starts a fresh one.
+  async _saveDoc() {
+    const bytes = await this.doc.save();
+    this._resetPageStreams();
+    return bytes;
+  }
+
+  _resetPageStreams() {
+    for (const page of this.doc.getPages()) {
+      page.contentStream = undefined;
+      page.contentStreamRef = undefined;
+    }
+  }
+
   async _currentSnapshot() {
     return {
-      bytes: await this.doc.save(),
+      bytes: await this._saveDoc(),
       dirtyPages: new Set(this.dirtyPages),
       ocrPages: new Set(this.ocrPages),
       coveredRegions: new Map(Array.from(this.coveredRegions, ([k, v]) => [k, v.slice()])),
@@ -285,7 +307,7 @@ class PdfEngine {
   }
 
   async _refreshRenderDoc() {
-    const bytes = await this.doc.save();
+    const bytes = await this._saveDoc();
     this.renderDoc = await pdfjsLib.getDocument({ data: bytes, ...PDFJS_DOC_OPTIONS }).promise;
   }
 
@@ -299,7 +321,9 @@ class PdfEngine {
 
   async getPageInfo(index) {
     const page = this.doc.getPage(index);
-    const { width, height } = page.getSize();
+    // size of what is actually shown: the crop box (which is the whole page unless cropped)
+    const box = page.getCropBox();
+    const { width, height } = box;
     const rotation = page.getRotation().angle;
     const { scanned: likelyScanned, textChars } = await this._scanStatus(index);
     return {
@@ -307,6 +331,10 @@ class PdfEngine {
       heightPt: height,
       rotation,
       sizeLabel: describeSize(width, height),
+      boxX: box.x,
+      boxY: box.y,
+      cropped: pagetools.hasCrop(this.doc, index),
+      flattened: pagetools.flattenedCount(this.doc, index),
       likelyScanned,
       textChars,
       ocrDone: this.ocrPages.has(index),
@@ -447,7 +475,9 @@ class PdfEngine {
 
   async getBytes() {
     const exportDoc = await this._buildExportDoc();
-    return exportDoc.save();
+    const out = await exportDoc.save();
+    if (exportDoc === this.doc) this._resetPageStreams();
+    return out;
   }
 
   // Builds the document actually handed to save()/download. Pages with live
@@ -493,6 +523,85 @@ class PdfEngine {
   // "insert pages from another PDF" picker), independent of the working doc.
   async loadExternalRenderDoc(bytes) {
     return pdfjsLib.getDocument({ data: bytes, ...PDFJS_DOC_OPTIONS }).promise;
+  }
+
+  // --- Page tools: crop, deskew, flatten ----------------------------------------
+
+  // items: [{ index, box: {x, y, width, height} }] — one undo step for all.
+  async cropPages(items) {
+    if (!items.length) return;
+    await this._snapshot();
+    for (const it of items) pagetools.setCrop(this.doc, it.index, it.box);
+    await this._refreshRenderDoc();
+  }
+
+  async resetCrops(indices) {
+    await this._snapshot();
+    for (const i of indices) pagetools.resetCrop(this.doc, i);
+    await this._refreshRenderDoc();
+  }
+
+  getCropBox(index) {
+    return pagetools.cropBoxOf(this.doc, index);
+  }
+
+  // The bounding box of everything visibly drawn on the page (anything darker
+  // than near-white), in PDF user space, plus `pad` points of margin.
+  async getContentBounds(index, pad = 14) {
+    const page = await this.renderDoc.getPage(index + 1);
+    const viewport = page.getViewport({ scale: 1 });
+    const w = Math.ceil(viewport.width), h = Math.ceil(viewport.height);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, w, h);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    const d = ctx.getImageData(0, 0, w, h).data;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        if (d[i] < 242 || d[i + 1] < 242 || d[i + 2] < 242) {
+          if (x < x0) x0 = x; if (x > x1) x1 = x;
+          if (y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+      }
+    }
+    canvas.width = canvas.height = 0;
+    if (x1 < 0) return null; // blank page
+    const [ax, ay] = viewport.convertToPdfPoint(Math.max(0, x0 - pad), Math.max(0, y0 - pad));
+    const [bx, by] = viewport.convertToPdfPoint(Math.min(w, x1 + 1 + pad), Math.min(h, y1 + 1 + pad));
+    return { x: Math.min(ax, bx), y: Math.min(ay, by), width: Math.abs(bx - ax), height: Math.abs(by - ay) };
+  }
+
+  async measureSkew(index) {
+    return measureSkewDegrees(this, index);
+  }
+
+  // items: [{ index, degrees }] — rotates content clockwise by `degrees`.
+  async deskewPages(items) {
+    if (!items.length) return;
+    await this._snapshot();
+    for (const it of items) pagetools.deskewContent(this.doc, it.index, it.degrees);
+    await this._refreshRenderDoc();
+  }
+
+  async flattenMarkups(indices) {
+    await this._snapshot();
+    let n = 0;
+    for (const i of indices) n += pagetools.flattenMarkups(this.doc, i);
+    await this._refreshRenderDoc();
+    return n;
+  }
+
+  async unflattenMarkups(indices) {
+    await this._snapshot();
+    let n = 0;
+    for (const i of indices) n += pagetools.unflattenMarkups(this.doc, i);
+    await this._refreshRenderDoc();
+    return n;
   }
 
   // --- Markups (annotations) -------------------------------------------------
@@ -741,6 +850,25 @@ class PdfEngine {
     return this.commitTextEdits([{ pageIndex: index, rect: originalRect, originalText, text, style }]);
   }
 
+  // True when (almost) nothing but `bg` is drawn inside `target` ({index, rect}).
+  async _regionIsBlank({ index, rect }, bg) {
+    try {
+      const { data, w, h, inner } = await this._renderRegion(index, rect, 0, 2);
+      const br = bg.r * 255, bgG = bg.g * 255, bb = bg.b * 255;
+      let off = 0, n = 0;
+      for (let y = Math.max(0, inner.y0); y < Math.min(h, inner.y1); y++) {
+        for (let x = Math.max(0, inner.x0); x < Math.min(w, inner.x1); x++) {
+          const i = (y * w + x) * 4;
+          n++;
+          if (Math.abs(data[i] - br) + Math.abs(data[i + 1] - bgG) + Math.abs(data[i + 2] - bb) > 60) off++;
+        }
+      }
+      return n > 0 && off / n < 0.012;
+    } catch {
+      return false;
+    }
+  }
+
   // Applies several text edits as ONE undo step. Every cover colour is sampled
   // from the page as it was *before* any of the edits, then they are all drawn.
   async commitTextEdits(edits) {
@@ -755,6 +883,20 @@ class PdfEngine {
       page.drawRectangle({ x: cover.x, y: cover.y, width: cover.width, height: cover.height, color: rgb(bg.r, bg.g, bg.b) });
       if (text.trim()) {
         const font = await this.doc.embedFont(pickStandardFont(style.fontFamily, style.bold, style.italic));
+        // Text longer than what it replaces runs past the patch. If the space
+        // beyond is empty page, carry the same background across it so the new
+        // text sits on what the original sat on (otherwise light text that was on
+        // a dark label ends up white-on-white and invisible). If something is
+        // there, leave it alone and just draw over it.
+        const newWidth = font.widthOfTextAtSize(text, style.fontSize);
+        if (newWidth > originalRect.width + 2) {
+          const box = page.getCropBox();
+          const right = Math.min(originalRect.x + newWidth + 2, box.x + box.width);
+          const ext = { x: cover.x + cover.width, y: cover.y, width: right - (cover.x + cover.width), height: cover.height };
+          if (ext.width > 1 && await this._regionIsBlank(i2(index, ext), bg)) {
+            page.drawRectangle({ x: ext.x, y: ext.y, width: ext.width, height: ext.height, color: rgb(bg.r, bg.g, bg.b) });
+          }
+        }
         page.drawText(text, {
           x: originalRect.x,
           y: originalRect.y + originalRect.height * 0.2,

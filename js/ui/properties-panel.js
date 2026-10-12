@@ -1,5 +1,6 @@
 import { PAGE_SIZES, FONT_VARIANTS } from '../pdf-engine.js';
 import { renderMarkupPanel } from './markup-panel.js';
+import { renderRedactPanel, renderCropPanel, pageToolsHtml, bindPageTools } from './page-tools-panel.js';
 
 let lastSignature = null;
 
@@ -7,6 +8,7 @@ export function renderPropertiesPanel(container, state, actions) {
   const signature = JSON.stringify([
     state.isLoaded, state.selectedPageIndex, state.docRevision, state.activeTool,
     state.textEdits.map((e) => [e.id, e.fontFamily, e.fontSize, e.color, e.bold, e.italic, e.underline]), state.activeTextEdit, state.redactColor, state.redactFill, state.redactMarks.length, state.selectedImage,
+    [state.redactMode, state.redactSearch.results ? [state.redactSearch.results.length, state.redactSearch.results.filter((r) => r.marked).length] : null, state.redactSearch.busy, state.redactSearch.error, state.redactSearch.preset, state.redactSearch.matchCase, state.redactSearch.wholeWord, state.redactSearch.regex], state.cropPageDraft, state.cropScope, state.pages.map((p) => [p.cropped, p.flattened, p.widthPt, p.heightPt]),
     state.activeTool === 'markup' ? [state.markupTool, state.selectedMarkup, state.markupStyle, state.stampKey, state.markupListOpen, state.markupFilter.type, state.markupFilter.author, state.markups.length, state.markupAuthor] : null,
   ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
@@ -24,6 +26,7 @@ export function renderPropertiesPanel(container, state, actions) {
   if (state.activeTool === 'markup') return renderMarkupPanel(container, state, actions);
   if (state.activeTool === 'text') return renderTextPanel(container, state, actions);
   if (state.activeTool === 'redact') return renderRedactPanel(container, state, actions);
+  if (state.activeTool === 'cropPage') return renderCropPanel(container, state, actions);
   if (state.activeTool === 'image') return renderImagePanel(container, state, actions);
   return renderPagePanel(container, state, actions);
 }
@@ -76,50 +79,6 @@ function renderTextPanel(container, state, actions) {
   container.querySelector('[data-role="bold"]').addEventListener('click', () => actions.onTextStyleChange({ bold: !te.bold }));
   container.querySelector('[data-role="italic"]').addEventListener('click', () => actions.onTextStyleChange({ italic: !te.italic }));
   container.querySelector('[data-role="underline"]').addEventListener('click', () => actions.onTextStyleChange({ underline: !te.underline }));
-}
-
-function renderRedactPanel(container, state, actions) {
-  const modes = [
-    ['match', 'Match page'],
-    ['black', 'Black'],
-    ['custom', 'Custom'],
-  ];
-  container.innerHTML = `
-    <span class="panel-section-title">Redaction</span>
-    <span class="panel-empty">Drag boxes over anything on the page you want gone — mark as many as you like (also across pages), then click <strong>Redact all</strong>. It's permanently removed from the file — not just covered — once you export, so this can't be undone by re-opening the PDF elsewhere.</span>
-
-    ${state.redactMarks.length ? `
-      <div class="ocr-card">
-        <div class="ocr-card-header"><span>${state.redactMarks.length} area${state.redactMarks.length === 1 ? '' : 's'} marked</span></div>
-        <button class="ocr-run-btn" data-role="redact-all" style="background:#C0453A;">Redact ${state.redactMarks.length > 1 ? 'all' : ''}</button>
-        <button class="btn-secondary" data-role="redact-clear" style="height:30px;font-size:12px;">Clear marks</button>
-      </div>` : ''}
-
-    <div class="field">
-      <span class="field-label">Fill</span>
-      <div class="segmented" role="radiogroup" aria-label="Redaction fill">
-        ${modes.map(([key, label]) => `
-          <button type="button" class="segmented-btn ${state.redactFill === key ? 'active' : ''}" role="radio" aria-checked="${state.redactFill === key}" data-fill="${key}">${label}</button>
-        `).join('')}
-      </div>
-      <span class="field-hint">${state.redactFill === 'match'
-        ? 'The area is filled with the surrounding page colour, so it simply looks blank — no black box.'
-        : state.redactFill === 'black' ? 'The area is covered with a solid black box.' : 'The area is covered with the colour you choose.'}</span>
-    </div>
-
-    ${state.redactFill === 'custom' ? `
-      <div class="field">
-        <span class="field-label">Colour</span>
-        <input type="color" data-role="color" value="${state.redactColor}" class="swatch" style="padding:0;cursor:pointer;" />
-      </div>
-    ` : ''}
-  `;
-  container.querySelectorAll('[data-fill]').forEach((btn) => {
-    btn.addEventListener('click', () => actions.onRedactFillChange(btn.dataset.fill));
-  });
-  container.querySelector('[data-role="color"]')?.addEventListener('input', (e) => actions.onRedactColorChange(e.target.value));
-  container.querySelector('[data-role="redact-all"]')?.addEventListener('click', () => actions.onConfirmRedaction());
-  container.querySelector('[data-role="redact-clear"]')?.addEventListener('click', () => actions.onCancelRedaction());
 }
 
 function renderImagePanel(container, state, actions) {
@@ -175,6 +134,10 @@ function renderPagePanel(container, state, actions) {
 
     <div class="section-divider"></div>
 
+    ${pageToolsHtml(state)}
+
+    <div class="section-divider"></div>
+
     <span class="panel-section-title">Text properties</span>
     <span class="panel-empty">Select the Edit Text tool, then click text on the page.</span>
 
@@ -199,4 +162,5 @@ function renderPagePanel(container, state, actions) {
   container.querySelector('[data-role="rotate-right"]').addEventListener('click', () => actions.onRotatePage(idx, 90));
   container.querySelector('[data-role="delete"]').addEventListener('click', () => actions.onDeletePage(idx));
   container.querySelector('[data-role="run-ocr"]')?.addEventListener('click', () => actions.onRunOcr(idx));
+  bindPageTools(container, actions);
 }

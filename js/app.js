@@ -4,7 +4,9 @@ import { renderToolbar } from './ui/toolbar.js';
 import { renderSidebar } from './ui/sidebar.js';
 import { renderCanvas, wireWorkspace, captureZoomAnchor, setScrollIntent, MIN_ZOOM, MAX_ZOOM } from './ui/canvas.js';
 import { renderPropertiesPanel } from './ui/properties-panel.js';
-import { openInsertPageModal, openMergeModal, openOcrModal, openExportOptionsModal } from './ui/modals.js';
+import { openInsertPageModal, openMergeModal, openOcrModal, openExportOptionsModal, openScopeModal, openDeskewModal } from './ui/modals.js';
+import { findText, PRESETS } from './textsearch.js';
+import { rectToInsets } from './ui/crop-tool.js';
 import { supportsFileSystemAccess, pickPdfToOpen, pickPdfSaveLocation, writeToHandle } from './file-io.js';
 import { buildDocxBlob, buildXlsxBlob, buildMarkupsXlsxBlob, markupsToCsv } from './export-formats.js';
 import { REVU_RED, REVU_YELLOW } from './markups.js';
@@ -26,7 +28,7 @@ let pendingImageReplace = null; // { pageIndex, rect } captured just before open
 let fileHandle = null; // FileSystemFileHandle for the open document, if opened/saved via that API
 
 function resetToolOverlays() {
-  update({ textEdits: [], activeTextEdit: null, redactMarks: [], selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null });
+  update({ textEdits: [], activeTextEdit: null, redactMarks: [], selectedImage: null, cropDraft: null, cropPageDraft: null, markupDraft: null, selectedMarkup: null });
 }
 
 function confirmDiscardIfDirty(message) {
@@ -154,6 +156,22 @@ async function runConversion(label, ext, build, options) {
   if (warnings.length) window.alert(`Exported, with notes:\n\n• ${[...new Set(warnings)].join('\n• ')}`);
 }
 
+// Which pages a page-level tool should act on.
+function scopeList() {
+  const list = [
+    { key: 'page', label: `This page (${(state.selectedPageIndex ?? 0) + 1})` },
+    { key: 'all', label: `All pages (${state.pageCount})` },
+  ];
+  if (state.checkedPages.size > 1) list.push({ key: 'selected', label: `Selected pages (${state.checkedPages.size})` });
+  return list;
+}
+
+function scopeIndices(key) {
+  if (key === 'all') return Array.from({ length: state.pageCount }, (_, i) => i);
+  if (key === 'selected' && state.checkedPages.size) return [...state.checkedPages].sort((a, b) => a - b);
+  return [state.selectedPageIndex ?? 0];
+}
+
 try { state.markupAuthor = localStorage.getItem('schurco-pdf-author') || null; } catch { /* storage unavailable */ }
 
 function ensureAuthor() {
@@ -170,13 +188,13 @@ const FILL_HEX = { none: null, white: '#FFFFFF', yellow: '#FFF2A8' };
 let textEditSeq = 0;
 const styleKey = (e) => JSON.stringify([e.fontFamily, e.fontSize, e.color, e.bold, e.italic, e.underline]);
 
-const STICKY_TOOLS = ['select', 'pan', 'text', 'redact', 'image', 'markup'];
+const STICKY_TOOLS = ['select', 'pan', 'text', 'redact', 'image', 'markup', 'cropPage'];
 
 const actions = {
   onToolClick(key) {
     if (STICKY_TOOLS.includes(key)) {
       cancelCloud();
-      update({ activeTool: key, textEdits: [], activeTextEdit: null, redactMarks: [], selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null, markupListOpen: key === 'markup' ? state.markupListOpen : false });
+      update({ activeTool: key, textEdits: [], activeTextEdit: null, redactMarks: [], selectedImage: null, cropDraft: null, cropPageDraft: null, markupDraft: null, selectedMarkup: null, markupListOpen: key === 'markup' ? state.markupListOpen : false });
       return;
     }
     if (key === 'deletePages') {
@@ -486,7 +504,58 @@ const actions = {
   },
 
   onCancelRedaction() {
-    update({ redactMarks: [] });
+    const rs = state.redactSearch;
+    if (rs.results) rs.results.forEach((r) => { r.marked = false; });
+    update({ redactMarks: [], redactSearch: { ...rs } });
+  },
+
+  onRedactModeChange(mode) {
+    update({ redactMode: mode });
+  },
+
+  // A batch of marks from one text selection.
+  onRedactMarksAdd(pageIndex, rects) {
+    update({ redactMarks: [...state.redactMarks, ...rects.map((rect) => ({ pageIndex, rect }))] });
+  },
+
+  onRedactSearchOpts(patch) {
+    update({ redactSearch: { ...state.redactSearch, ...patch } });
+  },
+
+  async onRedactFind() {
+    const rs = state.redactSearch;
+    let pattern, opts;
+    if (rs.preset) {
+      pattern = PRESETS.find((p) => p.key === rs.preset).pattern;
+      opts = { regex: true, matchCase: false, wholeWord: false };
+    } else {
+      pattern = (rs.query || '').trim();
+      opts = { matchCase: rs.matchCase, wholeWord: rs.wholeWord, regex: rs.regex };
+    }
+    if (!pattern) { update({ redactSearch: { ...rs, error: 'Type something to search for, or pick a pattern.' } }); return; }
+    update({ redactSearch: { ...rs, busy: true, error: '', results: null } });
+    try {
+      const results = await findText(engine, pattern, opts, (n, total) => update({ busyMessage: `Searching page ${n} of ${total}…` }));
+      results.forEach((r) => { r.marked = false; });
+      update({ busyMessage: '', redactSearch: { ...state.redactSearch, busy: false, results } });
+    } catch (err) {
+      update({ busyMessage: '', redactSearch: { ...state.redactSearch, busy: false, error: `That search isn't valid: ${err.message}` } });
+    }
+  },
+
+  // Marks one search result (and jumps to it), or every unmarked one.
+  onMarkSearchResults(i) {
+    const rs = state.redactSearch;
+    if (!rs.results) return;
+    const targets = i === undefined ? rs.results.filter((r) => !r.marked) : [rs.results[i]];
+    const marks = [...state.redactMarks];
+    for (const r of targets) {
+      r.marked = true;
+      for (const rect of r.rects) marks.push({ pageIndex: r.pageIndex, rect });
+    }
+    const patch = { redactMarks: marks, redactSearch: { ...rs } };
+    if (i !== undefined) patch.selectedPageIndex = rs.results[i].pageIndex;
+    update(patch);
   },
 
   onRedactColorChange(hex) {
@@ -505,8 +574,124 @@ const actions = {
       // 'match' passes no colour: the engine samples the page background.
       const colorHex = state.redactFill === 'black' ? '#000000' : state.redactFill === 'custom' ? state.redactColor : null;
       await engine.applyRedactions(marks, colorHex);
-      update({ redactMarks: [] });
+      update({ redactMarks: [], redactSearch: { ...state.redactSearch, results: null } });
       await refreshAll(page);
+    });
+  },
+
+  // --- Crop ----------------------------------------------------------------
+
+  onCropPageDrawn(pageIndex, rect) {
+    const info = state.pages[pageIndex];
+    if (!info) return;
+    update({ cropPageDraft: { pageIndex, insets: rectToInsets(info, rect) } });
+  },
+
+  onCropPageInsets(patch) {
+    const idx = state.selectedPageIndex ?? 0;
+    const cur = state.cropPageDraft && state.cropPageDraft.pageIndex === idx ? state.cropPageDraft.insets : { l: 0, t: 0, r: 0, b: 0 };
+    update({ cropPageDraft: { pageIndex: idx, insets: { ...cur, ...patch } } });
+  },
+
+  async onCropPageDetect() {
+    const idx = state.selectedPageIndex ?? 0;
+    const bounds = await engine.getContentBounds(idx, 14);
+    if (!bounds) { window.alert('This page looks blank, so there is no content to fit to.'); return; }
+    update({ cropPageDraft: { pageIndex: idx, insets: rectToInsets(state.pages[idx], bounds) } });
+  },
+
+  onCropScopeChange(scope) {
+    update({ cropScope: scope });
+  },
+
+  async onApplyCrop() {
+    const draft = state.cropPageDraft;
+    if (!draft) return;
+    const indices = state.cropScope === 'page' ? [draft.pageIndex] : scopeIndices(state.cropScope);
+    const items = indices.map((i) => {
+      const info = state.pages[i];
+      const ins = draft.insets;
+      return { index: i, box: { x: info.boxX + ins.l, y: info.boxY + ins.b, width: info.widthPt - ins.l - ins.r, height: info.heightPt - ins.t - ins.b } };
+    }).filter((it) => it.box.width > 20 && it.box.height > 20);
+    if (!items.length) { window.alert('Those margins would leave nothing of the page.'); return; }
+    await withBusy('Cropping…', async () => {
+      await engine.cropPages(items);
+      update({ cropPageDraft: null });
+      await refreshAll(state.selectedPageIndex);
+    });
+  },
+
+  async onResetCrop() {
+    const indices = (state.cropScope === 'page' ? [state.selectedPageIndex ?? 0] : scopeIndices(state.cropScope)).filter((i) => state.pages[i]?.cropped);
+    if (!indices.length) { window.alert('None of those pages are cropped.'); return; }
+    await withBusy('Resetting crop…', async () => {
+      await engine.resetCrops(indices);
+      update({ cropPageDraft: null });
+      await refreshAll(state.selectedPageIndex);
+    });
+  },
+
+  // --- Deskew / flatten ---------------------------------------------------------
+
+  onDeskewClick() {
+    if (!state.isLoaded) return;
+    openDeskewModal({
+      scopes: scopeList(),
+      currentIndex: state.selectedPageIndex ?? 0,
+      measure: (i) => engine.measureSkew(i),
+      onRun: async (scope, manual) => {
+        const indices = scopeIndices(scope);
+        let straightened = 0;
+        await withBusy('Deskewing…', async () => {
+          const items = [];
+          for (let k = 0; k < indices.length; k++) {
+            update({ busyMessage: `Measuring page ${indices[k] + 1} (${k + 1} of ${indices.length})…` });
+            const deg = manual ?? await engine.measureSkew(indices[k]);
+            if (Math.abs(deg) >= 0.1) items.push({ index: indices[k], degrees: deg });
+          }
+          straightened = items.length;
+          if (items.length) await engine.deskewPages(items);
+          await refreshAll(state.selectedPageIndex);
+        });
+        window.alert(straightened ? `Straightened ${straightened} page${straightened === 1 ? '' : 's'}${straightened < indices.length ? ` (${indices.length - straightened} already straight)` : ''}.` : 'Those pages are already straight.');
+      },
+    });
+  },
+
+  onFlattenClick() {
+    if (!state.isLoaded) return;
+    openScopeModal({
+      title: 'Flatten markups',
+      description: 'Bakes text boxes, clouds, stamps and the other markups into the page so they can no longer be moved or deleted by accident — handy before sending a drawing out. You can undo it with Unflatten (or Ctrl+Z).',
+      scopes: scopeList(),
+      confirmLabel: 'Flatten',
+      onRun: async (scope) => {
+        let n = 0;
+        await withBusy('Flattening…', async () => {
+          n = await engine.flattenMarkups(scopeIndices(scope));
+          update({ selectedMarkup: null });
+          await refreshAll(state.selectedPageIndex);
+        });
+        window.alert(n ? `Flattened ${n} markup${n === 1 ? '' : 's'}.` : 'There were no markups to flatten on those pages.');
+      },
+    });
+  },
+
+  onUnflattenClick() {
+    if (!state.isLoaded) return;
+    openScopeModal({
+      title: 'Unflatten markups',
+      description: 'Makes markups that were flattened with this editor editable again. (Markups flattened by other software can\'t be restored.)',
+      scopes: scopeList(),
+      confirmLabel: 'Unflatten',
+      onRun: async (scope) => {
+        let n = 0;
+        await withBusy('Unflattening…', async () => {
+          n = await engine.unflattenMarkups(scopeIndices(scope));
+          await refreshAll(state.selectedPageIndex);
+        });
+        window.alert(n ? `Restored ${n} markup${n === 1 ? '' : 's'}.` : 'Nothing was flattened on those pages.');
+      },
     });
   },
 
@@ -738,6 +923,7 @@ const actions = {
       zoom: 1,
       textEdits: [],
       activeTextEdit: null,
+      cropPageDraft: null,
       redactMarks: [],
       selectedImage: null,
       cropDraft: null,

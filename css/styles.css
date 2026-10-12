@@ -1159,3 +1159,19 @@ input[type="search"].field-box:focus { border-color: var(--accent) !important; }
 .canvas-area input, .canvas-area textarea { user-select: text; -webkit-user-select: text; }
 .te-input:focus { box-shadow: 0 0 0 3px rgba(33, 130, 64, 0.3); }
 .te-input:focus { width: max(100%, 220px) !important; position: relative; z-index: 5; }
+
+
+/* Page tools tiles */
+.tool-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tool-tile { height: 38px; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 0 8px; font-size: 12px; }
+.tool-tile:disabled { opacity: 0.45; cursor: not-allowed; }
+
+
+/* Edit Text view: the page is dimmed with a filter on the canvas; each editable run
+   applies the inverse brightness to what's behind it, so its own text shows normally. */
+.te-run {
+  background: transparent;
+  backdrop-filter: brightness(2);
+  -webkit-backdrop-filter: brightness(2);
+}
+.te-run:hover { background: rgba(33, 130, 64, 0.16); }

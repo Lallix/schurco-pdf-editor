@@ -1140,3 +1140,18 @@ export async function cropPage(engine, index, rect, erase = [], transparent = fa
 }
 
 export { paraText, lineText };
+
+
+// Measures how far a page's content leans, in degrees (positive = leans
+// anticlockwise, i.e. needs rotating clockwise to straighten). 0 when the page is
+// already straight or has too little content to tell.
+export async function measureSkewDegrees(engine, index) {
+  const page = await engine.renderDoc.getPage(index + 1);
+  const vp = page.getViewport({ scale: 1 });
+  const raster = await renderRaster(page, vp.width, vp.height);
+  try {
+    return (estimateSkew(raster) * 180) / Math.PI;
+  } finally {
+    raster.canvas.width = raster.canvas.height = 0;
+  }
+}

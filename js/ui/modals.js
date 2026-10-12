@@ -380,3 +380,74 @@ export function openExportOptionsModal({ kind, pageCount, selectedCount, onRun }
     onRun(options);
   });
 }
+
+
+const scopeRadios = (scopes, def) => scopes.map((sc) => `
+  <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--ink);cursor:pointer;">
+    <input type="radio" name="scope" value="${sc.key}" ${sc.key === def ? 'checked' : ''} /> ${sc.label}
+  </label>`).join('');
+
+// Small "which pages?" dialog. `onRun(scopeKey)` does the work.
+export function openScopeModal({ title, description, scopes, defaultScope, confirmLabel = 'Apply', onRun }) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-label="${title}">
+      <h3>${title}</h3>
+      <span class="panel-empty">${description}</span>
+      <div class="field"><span class="field-label">Pages</span>${scopeRadios(scopes, defaultScope || scopes[0].key)}</div>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" data-role="cancel">Cancel</button>
+        <button type="button" class="btn-primary" data-role="run">${confirmLabel}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+  backdrop.querySelector('[data-role="cancel"]').addEventListener('click', () => closeModal(backdrop));
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(backdrop); });
+  backdrop.querySelector('[data-role="run"]').addEventListener('click', () => {
+    const scope = backdrop.querySelector('input[name="scope"]:checked')?.value;
+    closeModal(backdrop);
+    onRun(scope);
+  });
+}
+
+// Deskew dialog: shows the skew measured on the open page, lets the user
+// override the angle, and applies it to the chosen pages (each page's own
+// angle is measured unless an override is typed in).
+export function openDeskewModal({ scopes, currentIndex, measure, onRun }) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-label="Deskew">
+      <h3>Deskew scanned pages</h3>
+      <span class="panel-empty">Straightens pages that were scanned at a slight angle by rotating their content. Markups on the page aren't rotated with it.</span>
+      <div class="ocr-card" style="gap:6px;">
+        <div class="ocr-card-header"><span data-role="measured">Measuring page ${currentIndex + 1}…</span></div>
+      </div>
+      <div class="field"><span class="field-label">Pages</span>${scopeRadios(scopes, scopes[0].key)}</div>
+      <div class="field">
+        <span class="field-label">Angle (optional) — leave empty to measure each page automatically</span>
+        <input type="number" step="0.1" min="-15" max="15" class="field-box" data-role="manual" placeholder="e.g. 1.2 (degrees, clockwise)" style="border:1px solid var(--line);" />
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" data-role="cancel">Cancel</button>
+        <button type="button" class="btn-primary" data-role="run">Deskew</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+  const label = backdrop.querySelector('[data-role="measured"]');
+  measure(currentIndex).then((deg) => {
+    if (!backdrop.isConnected) return;
+    label.textContent = Math.abs(deg) < 0.1
+      ? `Page ${currentIndex + 1} looks straight already.`
+      : `Page ${currentIndex + 1} leans about ${Math.abs(deg).toFixed(1)}° ${deg > 0 ? 'anticlockwise' : 'clockwise'}.`;
+  }).catch(() => { label.textContent = `Could not measure page ${currentIndex + 1}.`; });
+  backdrop.querySelector('[data-role="cancel"]').addEventListener('click', () => closeModal(backdrop));
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(backdrop); });
+  backdrop.querySelector('[data-role="run"]').addEventListener('click', () => {
+    const scope = backdrop.querySelector('input[name="scope"]:checked')?.value;
+    const raw = backdrop.querySelector('[data-role="manual"]').value.trim();
+    closeModal(backdrop);
+    onRun(scope, raw === '' ? null : Number(raw));
+  });
+}

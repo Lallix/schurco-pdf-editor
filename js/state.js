@@ -35,6 +35,10 @@ export const state = {
   // Phase 2 interactive tool state
   textEdits: [],       // open text edits: { id, pageIndex, rect, text (original), draft (typed), fontFamily, fontSize, color, bold, italic, underline }
   activeTextEdit: null, // id of the edit whose style the panel shows
+  redactMode: 'box',   // 'box' = draw boxes | 'text' = select text to mark it
+  redactSearch: { query: '', preset: '', matchCase: false, wholeWord: false, regex: false, results: null, busy: false, error: '' },
+  cropPageDraft: null, // { pageIndex, insets: {l,t,r,b} in points } — crop area being set
+  cropScope: 'page',
   redactMarks: [],     // [{ pageIndex, rect }] — areas marked for redaction, applied together on confirm
   redactFill: 'match', // 'match' = blend into the page background (default) | 'black' | 'custom'
   redactColor: '#111111', // used when redactFill is 'custom'
