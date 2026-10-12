@@ -765,3 +765,67 @@ export async function buildXlsxBlob(engine, pageIndices, opts = {}, onProgress) 
     warnings,
   };
 }
+
+
+// ===========================================================================
+// Markups List export
+
+function markupRows(markups) {
+  return markups.map((m) => ({
+    Page: m.pageIndex + 1,
+    Type: m.type,
+    Author: m.author || '',
+    Date: m.date ? new Date(m.date) : null,
+    Subject: m.subject || '',
+    Comment: m.contents || '',
+    Colour: m.color || '',
+    Status: m.status || '',
+  }));
+}
+
+export function markupsToCsv(markups) {
+  const cols = ['Page', 'Type', 'Author', 'Date', 'Subject', 'Comment', 'Colour', 'Status'];
+  const q = (v) => {
+    const t = v instanceof Date ? v.toISOString().slice(0, 16).replace('T', ' ') : String(v ?? '');
+    return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const lines = [cols.join(',')];
+  for (const r of markupRows(markups)) lines.push(cols.map((c) => q(r[c])).join(','));
+  // BOM so Excel opens the UTF-8 file with the right characters
+  return new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+}
+
+export async function buildMarkupsXlsxBlob(markups, title = 'Markups') {
+  const ExcelJS = await loadExcelJS();
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Schurco PDF Editor';
+  const ws = wb.addWorksheet('Markups List', { views: [{ state: 'frozen', ySplit: 1 }] });
+  const cols = [
+    ['Page', 7], ['Type', 14], ['Author', 20], ['Date', 17], ['Subject', 14], ['Comment', 70], ['Colour', 10], ['Status', 10],
+  ];
+  ws.columns = cols.map(([header, width]) => ({ header, key: header, width }));
+  for (const r of markupRows(markups)) ws.addRow(r);
+  const head = ws.getRow(1);
+  head.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF218240' } };
+  head.alignment = { vertical: 'middle' };
+  head.height = 22;
+  ws.getColumn('Date').numFmt = 'dd mmm yyyy hh:mm';
+  ws.getColumn('Comment').alignment = { wrapText: true, vertical: 'top' };
+  ws.eachRow((row, n) => {
+    if (n > 1) row.alignment = { vertical: 'top', wrapText: true };
+  });
+  ws.autoFilter = { from: 'A1', to: `H${ws.rowCount}` };
+  // show each markup's colour as a swatch in the Colour cell
+  ws.eachRow((row, n) => {
+    if (n === 1) return;
+    const c = row.getCell('Colour').value;
+    if (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c)) {
+      row.getCell('Colour').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: `FF${c.slice(1).toUpperCase()}` } };
+      row.getCell('Colour').font = { color: { argb: 'FF888888' }, size: 8 };
+    }
+  });
+  void title;
+  const buffer = await wb.xlsx.writeBuffer();
+  return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}

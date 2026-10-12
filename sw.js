@@ -1,4 +1,4 @@
-const CACHE = 'schurco-pdf-editor-v8';
+const CACHE = 'schurco-pdf-editor-v9';
 const ASSETS = [
   './',
   './index.html',
@@ -10,11 +10,14 @@ const ASSETS = [
   './js/file-io.js',
   './js/export-formats.js',
   './js/layout.js',
+  './js/markups.js',
   './js/ui/toolbar.js',
   './js/ui/sidebar.js',
   './js/ui/canvas.js',
   './js/ui/properties-panel.js',
   './js/ui/modals.js',
+  './js/ui/markup-tools.js',
+  './js/ui/markup-panel.js',
   './js/vendor/pdf.min.mjs',
   './js/vendor/pdf.worker.min.mjs',
   './js/vendor/pdf-lib.esm.min.js',

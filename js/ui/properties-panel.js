@@ -1,4 +1,5 @@
 import { PAGE_SIZES, FONT_VARIANTS } from '../pdf-engine.js';
+import { renderMarkupPanel } from './markup-panel.js';
 
 let lastSignature = null;
 
@@ -6,6 +7,7 @@ export function renderPropertiesPanel(container, state, actions) {
   const signature = JSON.stringify([
     state.isLoaded, state.selectedPageIndex, state.docRevision, state.activeTool,
     state.textEdit, state.redactColor, state.redactFill, state.selectedImage,
+    state.activeTool === 'markup' ? [state.markupTool, state.selectedMarkup, state.markupStyle, state.stampKey, state.markupListOpen, state.markupFilter.type, state.markupFilter.author, state.markups.length, state.markupAuthor] : null,
   ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
   lastSignature = signature;
@@ -19,6 +21,7 @@ export function renderPropertiesPanel(container, state, actions) {
     return;
   }
 
+  if (state.activeTool === 'markup') return renderMarkupPanel(container, state, actions);
   if (state.activeTool === 'text') return renderTextPanel(container, state, actions);
   if (state.activeTool === 'redact') return renderRedactPanel(container, state, actions);
   if (state.activeTool === 'image') return renderImagePanel(container, state, actions);

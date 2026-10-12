@@ -7,6 +7,7 @@ import * as pdfjsLib from './vendor/pdf.min.mjs';
 import { OPS } from './vendor/pdf.min.mjs';
 import { PDFDocument, degrees, rgb, StandardFonts } from './vendor/pdf-lib.esm.min.js';
 import Tesseract from './vendor/tesseract/tesseract.esm.min.js';
+import * as markups from './markups.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './js/vendor/pdf.worker.min.mjs';
 
@@ -492,6 +493,30 @@ class PdfEngine {
   // "insert pages from another PDF" picker), independent of the working doc.
   async loadExternalRenderDoc(bytes) {
     return pdfjsLib.getDocument({ data: bytes, ...PDFJS_DOC_OPTIONS }).promise;
+  }
+
+  // --- Markups (annotations) -------------------------------------------------
+
+  getMarkups() {
+    return this.doc ? markups.readMarkups(this.doc) : [];
+  }
+
+  // Adds a markup (see markups.js for the spec); returns its ref key.
+  async addMarkup(spec) {
+    await this._snapshot();
+    const key = await markups.createMarkup(this.doc, spec);
+    await this._refreshRenderDoc();
+    return key;
+  }
+
+  // op: { move: [dx, dy] } | { restyle: patch } | { text } | { remove: true }
+  async editMarkup(key, op) {
+    await this._snapshot();
+    if (op.move) markups.moveMarkup(this.doc, key, op.move[0], op.move[1]);
+    else if (op.restyle) await markups.restyleMarkup(this.doc, key, op.restyle);
+    else if (op.text !== undefined) await markups.setMarkupText(this.doc, key, op.text);
+    else if (op.remove) markups.deleteMarkup(this.doc, key);
+    await this._refreshRenderDoc();
   }
 
   // --- Text editing (redact-and-replace) -----------------------------------

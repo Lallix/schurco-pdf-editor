@@ -1,4 +1,5 @@
 import { engine } from '../pdf-engine.js';
+import { markupBarHtml, wireMarkupBar, wireMarkupCreate, renderMarkupOverlays } from './markup-tools.js';
 
 // Zoom is a multiplier on "fit to screen": 100% always means the whole page
 // fits the workspace, whatever the page size or window size.
@@ -101,6 +102,7 @@ export async function renderCanvas(container, state, actions) {
     state.isLoaded, state.selectedPageIndex, state.zoom, state.docRevision, state.activeTool,
     state.textEdit ? { r: state.textEdit.rect, s: state.textEdit.fontFamily, sz: state.textEdit.fontSize, c: state.textEdit.color, b: state.textEdit.bold, i: state.textEdit.italic, u: state.textEdit.underline } : null,
     state.redactDraft, state.redactFill, state.redactColor, state.selectedImage, state.cropDraft,
+    state.markupTool, state.selectedMarkup, state.markupDraft, state.markupListOpen, state.markupStyle.color, state.markupStyle.lineWidth, state.markupStyle.fontSize,
     container.offsetWidth, container.offsetHeight,
   ]);
   if (signature === lastSignature && container.dataset.rendered === '1') return;
@@ -152,6 +154,7 @@ export async function renderCanvas(container, state, actions) {
         <div class="page-overlays" style="position:absolute;inset:0;pointer-events:none;"></div>
       </div>
     </div>
+    ${state.activeTool === 'markup' ? markupBarHtml(state) : ''}
     <div class="nav-pill">
       <button class="nav-pill-btn" data-role="prev" aria-label="Previous page" title="Previous page" ${idx <= 0 ? 'disabled' : ''}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
@@ -179,6 +182,7 @@ export async function renderCanvas(container, state, actions) {
   container.querySelector('[data-role="zoom-out"]').addEventListener('click', () => actions.onZoomStep(-1));
   container.querySelector('[data-role="zoom-in"]').addEventListener('click', () => actions.onZoomStep(1));
   container.querySelector('[data-role="fit"]').addEventListener('click', () => actions.onFit());
+  if (state.activeTool === 'markup') wireMarkupBar(container, actions);
 
   const wrap = container.querySelector('.page-sheet-wrap');
   let canvas = container.querySelector('.page-sheet');
@@ -231,16 +235,19 @@ export async function renderCanvas(container, state, actions) {
   const textRuns = (state.activeTool === 'text' && !state.textEdit) ? await engine.getTextRuns(idx) : null;
   if (myGeneration !== renderGeneration) return;
 
-  wireToolInteractions(hit, overlays, idx, viewport, state, actions);
-  renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns);
-  ensurePainted(container, idx, viewport, state.docRevision);
-
-  if (state.activeTool === 'select') {
-    const layer = document.createElement('div');
+  // The selectable text layer serves the Select tool and the text-markup tools.
+  const textMarkup = state.activeTool === 'markup' && ['highlight', 'underline', 'strike'].includes(state.markupTool);
+  let layer = null;
+  if (state.activeTool === 'select' || textMarkup) {
+    layer = document.createElement('div');
     layer.className = 'text-layer';
     wrap.insertBefore(layer, overlays);
     buildTextLayer(layer, idx, viewport, myGeneration).catch(() => {});
   }
+
+  wireToolInteractions(hit, overlays, idx, viewport, state, actions, layer);
+  renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns);
+  ensurePainted(container, idx, viewport, state.docRevision);
 }
 
 // Paints the page bitmap off-screen at hi-DPI and swaps it into the visible
@@ -313,8 +320,9 @@ async function buildTextLayer(layer, idx, viewport, generation) {
   });
 }
 
-function wireToolInteractions(hit, overlays, idx, viewport, state, actions) {
+function wireToolInteractions(hit, overlays, idx, viewport, state, actions, textLayerEl) {
   const tool = state.activeTool;
+  if (tool === 'markup') { wireMarkupCreate(hit, overlays, idx, viewport, state, actions, textLayerEl); return; }
   hit.style.cursor = tool === 'pan' ? 'grab' : tool === 'select' ? 'default' : 'crosshair';
 
   if (tool === 'image') {
@@ -386,6 +394,7 @@ function wireToolInteractions(hit, overlays, idx, viewport, state, actions) {
 
 function renderOverlays(overlays, idx, viewport, state, actions, isNewTextEdit, textRuns) {
   overlays.innerHTML = '';
+  if (state.activeTool === 'markup') renderMarkupOverlays(overlays, idx, viewport, state, actions);
 
   // Dimming layers are clipped to the page; everything else may overhang the
   // page edge onto the pasteboard.

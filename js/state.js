@@ -21,6 +21,17 @@ export const state = {
   canUndo: false,
   canRedo: false,
 
+  // Phase 5: markups (annotations)
+  markups: [],               // every markup in the document (see markups.js readMarkups)
+  markupTool: 'select',      // which markup tool is active while activeTool === 'markup'
+  markupStyle: { color: null, lineWidth: null, fontSize: 10, fill: 'auto' }, // null = the tool's own default
+  stampKey: 'Draft',
+  selectedMarkup: null,      // ref key of the selected markup
+  markupDraft: null,         // in-progress markup awaiting text / a leader point
+  markupListOpen: false,
+  markupFilter: { search: '', type: 'all', author: 'all' },
+  markupAuthor: null,        // name written into new markups
+
   // Phase 2 interactive tool state
   textEdit: null,      // { pageIndex, rect, text, fontFamily, fontSize, color, bold, italic, underline }
   redactDraft: null,   // { pageIndex, rect } — drawn, awaiting confirm

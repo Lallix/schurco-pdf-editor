@@ -6,7 +6,9 @@ import { renderCanvas, wireWorkspace, captureZoomAnchor, setScrollIntent, MIN_ZO
 import { renderPropertiesPanel } from './ui/properties-panel.js';
 import { openInsertPageModal, openMergeModal, openOcrModal, openExportOptionsModal } from './ui/modals.js';
 import { supportsFileSystemAccess, pickPdfToOpen, pickPdfSaveLocation, writeToHandle } from './file-io.js';
-import { buildDocxBlob, buildXlsxBlob } from './export-formats.js';
+import { buildDocxBlob, buildXlsxBlob, buildMarkupsXlsxBlob, markupsToCsv } from './export-formats.js';
+import { REVU_RED, REVU_YELLOW } from './markups.js';
+import { cancelCloud } from './ui/markup-tools.js';
 
 const els = {
   toolbar: document.getElementById('toolbar'),
@@ -24,7 +26,7 @@ let pendingImageReplace = null; // { pageIndex, rect } captured just before open
 let fileHandle = null; // FileSystemFileHandle for the open document, if opened/saved via that API
 
 function resetToolOverlays() {
-  update({ textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null });
+  update({ textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null });
 }
 
 function confirmDiscardIfDirty(message) {
@@ -61,6 +63,7 @@ async function withBusy(message, fn) {
 
 async function refreshAll(preferredSelectedIndex) {
   const pageCount = engine.getPageCount();
+  const markups = engine.getMarkups();
   const pages = await Promise.all(
     Array.from({ length: pageCount }, (_, i) => engine.getPageInfo(i))
   );
@@ -79,6 +82,8 @@ async function refreshAll(preferredSelectedIndex) {
     canUndo: engine.canUndo(),
     canRedo: engine.canRedo(),
     checkedPages: new Set(),
+    markups,
+    selectedMarkup: markups.some((m) => m.ref === state.selectedMarkup) ? state.selectedMarkup : null,
   });
 }
 
@@ -149,12 +154,26 @@ async function runConversion(label, ext, build, options) {
   if (warnings.length) window.alert(`Exported, with notes:\n\n• ${[...new Set(warnings)].join('\n• ')}`);
 }
 
-const STICKY_TOOLS = ['select', 'pan', 'text', 'redact', 'image'];
+try { state.markupAuthor = localStorage.getItem('schurco-pdf-author') || null; } catch { /* storage unavailable */ }
+
+function ensureAuthor() {
+  if (state.markupAuthor) return true;
+  const name = window.prompt('Your name — it is saved on every markup you add, so reviewers can see who wrote it:', '');
+  if (!name || !name.trim()) return false;
+  state.markupAuthor = name.trim();
+  try { localStorage.setItem('schurco-pdf-author', state.markupAuthor); } catch { /* ignore */ }
+  return true;
+}
+
+const FILL_HEX = { none: null, white: '#FFFFFF', yellow: '#FFF2A8' };
+
+const STICKY_TOOLS = ['select', 'pan', 'text', 'redact', 'image', 'markup'];
 
 const actions = {
   onToolClick(key) {
     if (STICKY_TOOLS.includes(key)) {
-      update({ activeTool: key, textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null });
+      cancelCloud();
+      update({ activeTool: key, textEdit: null, redactDraft: null, selectedImage: null, cropDraft: null, markupDraft: null, selectedMarkup: null, markupListOpen: key === 'markup' ? state.markupListOpen : false });
       return;
     }
     if (key === 'deletePages') {
@@ -497,6 +516,114 @@ const actions = {
     });
   },
 
+  // --- Markups ---------------------------------------------------------------
+
+  onMarkupToolChange(key) {
+    cancelCloud();
+    update({ markupTool: key, markupDraft: null, markupListOpen: false, selectedMarkup: key === 'select' ? state.selectedMarkup : null });
+  },
+
+  onMarkupDraft(draft) {
+    update({ markupDraft: draft });
+  },
+
+  onStampChange(key) {
+    update({ stampKey: key });
+  },
+
+  onChangeAuthor() {
+    const name = window.prompt('Author name for new markups:', state.markupAuthor || '');
+    if (!name || !name.trim()) return;
+    state.markupAuthor = name.trim();
+    try { localStorage.setItem('schurco-pdf-author', state.markupAuthor); } catch { /* ignore */ }
+    update({ markupAuthor: state.markupAuthor });
+  },
+
+  async onCreateMarkup(spec) {
+    if (!ensureAuthor()) { update({ markupDraft: null }); return; }
+    const st = state.markupStyle;
+    const kind = spec.kind;
+    const isText = kind === 'FreeText' || kind === 'FreeTextCallout';
+    const full = {
+      ...spec,
+      stage: undefined,
+      author: state.markupAuthor,
+      color: st.color || (kind === 'Highlight' ? REVU_YELLOW : REVU_RED),
+      lineWidth: st.lineWidth ?? undefined,
+      fontSize: st.fontSize,
+      fill: st.fill === 'auto' ? (isText ? '#FFFFFF' : null) : FILL_HEX[st.fill] ?? null,
+      opacity: kind === 'Highlight' ? 0.5 : 1,
+    };
+    try {
+      await engine.addMarkup(full);
+    } catch (err) {
+      window.alert(`Could not add that markup: ${err.message}`);
+      update({ markupDraft: null });
+      return;
+    }
+    update({ markupDraft: null });
+    await refreshAll(spec.pageIndex);
+  },
+
+  onSelectMarkup(ref, pageIndex, opts = {}) {
+    const patch = { selectedMarkup: ref, activeTool: 'markup', markupDraft: null, focusMarkupText: !!opts.focusText };
+    if (opts.fromList) patch.markupTool = 'select';
+    if (pageIndex !== undefined && pageIndex !== state.selectedPageIndex) patch.selectedPageIndex = pageIndex;
+    update(patch);
+  },
+
+  async onMoveMarkup(ref, dx, dy) {
+    const m = state.markups.find((x) => x.ref === ref);
+    await engine.editMarkup(ref, { move: [dx, dy] });
+    await refreshAll(m ? m.pageIndex : state.selectedPageIndex);
+  },
+
+  async onResizeMarkup(ref, patch) {
+    const m = state.markups.find((x) => x.ref === ref);
+    await engine.editMarkup(ref, { restyle: patch });
+    await refreshAll(m ? m.pageIndex : state.selectedPageIndex);
+  },
+
+  // Style edits apply to the selected markup if there is one, else become the
+  // defaults for the next ones drawn.
+  async onMarkupStyleChange(patch) {
+    const sel = state.markups.find((m) => m.ref === state.selectedMarkup);
+    if (!sel) { update({ markupStyle: { ...state.markupStyle, ...patch } }); return; }
+    const restyle = { ...patch };
+    if ('fill' in patch) restyle.fill = FILL_HEX[patch.fill] ?? null;
+    await engine.editMarkup(sel.ref, { restyle });
+    await refreshAll(sel.pageIndex);
+  },
+
+  async onSetMarkupText(ref, text) {
+    const m = state.markups.find((x) => x.ref === ref);
+    await engine.editMarkup(ref, { text });
+    await refreshAll(m ? m.pageIndex : state.selectedPageIndex);
+  },
+
+  async onDeleteMarkup(ref) {
+    const m = state.markups.find((x) => x.ref === ref);
+    await engine.editMarkup(ref, { remove: true });
+    update({ selectedMarkup: null });
+    await refreshAll(m ? m.pageIndex : state.selectedPageIndex);
+  },
+
+  onToggleMarkupList() {
+    update({ markupListOpen: !state.markupListOpen, activeTool: 'markup', selectedMarkup: state.markupListOpen ? state.selectedMarkup : null });
+  },
+
+  onMarkupFilter(patch) {
+    update({ markupFilter: { ...state.markupFilter, ...patch } });
+  },
+
+  async onExportMarkups(kind, rows) {
+    const base = (state.fileName || 'document.pdf').replace(/\.pdf$/i, '');
+    if (kind === 'csv') { downloadBlob(markupsToCsv(rows), `${base} - markups.csv`); return; }
+    await withBusy('Building Excel…', async () => {
+      downloadBlob(await buildMarkupsXlsxBlob(rows), `${base} - markups.xlsx`);
+    });
+  },
+
   // --- Undo / redo ------------------------------------------------------
 
   async onUndo() {
@@ -646,6 +773,17 @@ window.addEventListener('keydown', (e) => {
   // Text, Redact, Edit Image) — works whether you're mid-edit (an input may
   // have already handled/bubbled the key) or just browsing, e.g. the Edit
   // Text tool's highlighted-runs view with nothing selected yet.
+  if (e.key === 'Escape' && state.activeTool === 'markup') {
+    if (state.markupDraft) { e.preventDefault(); actions.onMarkupDraft(null); return; }
+    if (state.selectedMarkup) { e.preventDefault(); update({ selectedMarkup: null }); return; }
+    if (state.markupTool !== 'select') { e.preventDefault(); actions.onMarkupToolChange('select'); return; }
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && state.activeTool === 'markup' && state.selectedMarkup
+      && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+    e.preventDefault();
+    actions.onDeleteMarkup(state.selectedMarkup);
+    return;
+  }
   if (e.key === 'Escape' && state.activeTool !== 'select') {
     e.preventDefault();
     actions.onToolClick('select');

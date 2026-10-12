@@ -1,5 +1,6 @@
 const ICONS = {
   select: '<path d="M9 4h6M9 20h6M12 4v16"/>',
+  markup: '<path d="M5 4h14v12h-8l-4 4v-4H5z"/><path d="M9 8h6M9 11h4"/>',
   pan: '<path d="M8 12V6.5a1.5 1.5 0 0 1 3 0V11"/><path d="M11 10.5V4.5a1.5 1.5 0 0 1 3 0V11"/><path d="M14 10.5V6a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1-6 6h-.5a6 6 0 0 1-4.7-2.3L3.4 14.8a1.5 1.5 0 0 1 2.3-1.9L8 15"/>',
   text: '<path d="M5 5h14M12 5v14"/>',
   redact: '<path d="M4 20l4-1 10.3-10.3-3-3L5 16l-1 4z"/><path d="M14 6.7l3 3"/>',
@@ -22,6 +23,7 @@ const TOOL_GROUPS = [
     { key: 'text', label: 'Edit text', sticky: true },
     { key: 'redact', label: 'Redact', sticky: true },
     { key: 'image', label: 'Edit images', sticky: true },
+    { key: 'markup', label: 'Markup — text boxes, callouts, clouds, arrows, highlights, stamps', sticky: true },
   ],
   [
     { key: 'insertPage', label: 'Insert page' },
