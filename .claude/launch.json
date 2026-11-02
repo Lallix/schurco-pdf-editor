@@ -4,8 +4,9 @@
     {
       "name": "schurco-pdf-editor",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "5173"],
-      "port": 5173
+      "runtimeArgs": ["-m", "http.server", "8094", "--bind", "127.0.0.1"],
+      "port": 8094,
+      "autoPort": false
     }
   ]
 }
