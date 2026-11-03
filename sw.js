@@ -1,4 +1,4 @@
-const CACHE = 'schurco-pdf-editor-v10';
+const CACHE = 'schurco-pdf-editor-v11';
 const ASSETS = [
   './',
   './index.html',

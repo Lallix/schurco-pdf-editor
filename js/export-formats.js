@@ -430,7 +430,24 @@ function parseNumber(text) {
     return { value: Number(t.replace(/,/g, '')), fmt: `#,##0${dec ? '.' + '0'.repeat(dec) : ''}` };
   }
   if (/^-?\d+(\.\d+)?%$/.test(t)) return { value: Number(t.slice(0, -1)) / 100, fmt: '0.0%' };
+  // Currency such as "$ 25,536.86", "R 1,200.00" or "USD 50". A bare "R" must be
+  // followed by a space so codes like R101 stay text.
+  const cur = /^(-)?\s*(US\$|\$|€|£|USD|EUR|GBP|ZAR|R(?=\s))\s*(-)?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?$/.exec(t);
+  if (cur) {
+    const dec = cur[5] ? cur[5].length - 1 : 0;
+    const sym = cur[2] === 'US$' ? '$' : cur[2];
+    const neg = cur[1] || cur[3] ? -1 : 1;
+    return {
+      value: neg * Number(cur[4].replace(/,/g, '') + (cur[5] || '')),
+      fmt: `"${sym}" #,##0${dec ? '.' + '0'.repeat(dec) : ''}`,
+    };
+  }
   return null;
+}
+
+// Excel column width (characters) a formatted number needs so it never shows ###.
+function numberWidthFor(text, fs) {
+  return Math.min(60, ptToColWidth(text.length * 0.56 * fs + 6) + 1);
 }
 
 function lineTextOf(line) {
@@ -461,6 +478,7 @@ function setCellText(cell, paragraphs, { wrap = true, numeric = true } = {}) {
   if (num) {
     cell.value = num.value;
     cell.numFmt = num.fmt;
+    numeric = { text, fs: dominant.fs };
   } else if (keys.size > 1) {
     const rich = [];
     paragraphs.forEach((p, pi) => {
@@ -487,6 +505,15 @@ function setCellText(cell, paragraphs, { wrap = true, numeric = true } = {}) {
     vertical: 'top',
     wrapText: wrap,
   };
+  return num ? numeric : null;
+}
+
+// Widens columns c1..c2 (1-based) of `ws` until `needed` Excel width units fit,
+// so numbers don't turn into ###.
+function ensureWidth(ws, c1, c2, needed) {
+  let have = 0;
+  for (let c = c1; c <= c2; c++) have += ws.getColumn(c).width || 8.43;
+  if (have < needed) ws.getColumn(c1).width = (ws.getColumn(c1).width || 8.43) + (needed - have);
 }
 
 // Height (pt) a block of lines needs in Excel: Excel wants about 1.25x the font
@@ -550,6 +577,101 @@ async function addPicture(wb, ws, engine, idx, rect, colB, rowB, erase = [], tra
   ws.addImage(id, { tl: { col: pos(colB, rect.x0), row: pos(rowB, rect.y0) }, ext: { width: px(width), height: px(height) }, editAs: 'oneCell' });
 }
 
+// ---------------------------------------------------------------------------
+// Borderless line items under a ruled header row (quotes, invoices, schedules).
+// The header ("Item code | Description | Qty | Unit price | Amount") is a ruled
+// table, but the rows beneath it have no rules, so they come out as loose text
+// lines that run a code, a description and a price into one cell. Each such line
+// is cut at the header's column edges into one piece per column, so every value
+// lands in its own column (amounts then become real numbers).
+
+const HEADER_WORDS = /\b(item|code|part|description|descr|qty|quantity|unit|price|rate|discount|disc|amount|total|uom|ref|line|no)\b/i;
+
+function findItemHeader(tables) {
+  for (const t of tables) {
+    const row = t.cells.filter((c) => c.r === 0);
+    if (row.length < 3 || t.ys.length > 3) continue; // one header row, not a full table
+    const hits = row.filter((c) => c.text && HEADER_WORDS.test(c.text)).length;
+    if (hits >= Math.max(3, Math.ceil(row.length * 0.6))) return { table: t, cols: row.map((c) => ({ x0: c.rect.x0, x1: c.rect.x1, text: c.text })).sort((p, q) => p.x0 - q.x0) };
+  }
+  return null;
+}
+
+function runsFromItems(items) {
+  const runs = [];
+  for (const it of items) {
+    const cur = runs[runs.length - 1];
+    const same = cur && cur.font.name === it.font.name && cur.font.bold === it.font.bold && cur.font.italic === it.font.italic
+      && Math.abs(cur.fs - it.fs) < 0.6 && (cur.color || null) === (it.color || null) && !!cur.underline === !!it.underline;
+    if (same) { cur.text += (/\s$/.test(cur.text) ? '' : ' ') + it.str.trim(); cur.x1 = it.x1; }
+    else runs.push({ text: it.str.trim(), font: it.font, fs: it.fs, x0: it.x0, x1: it.x1, base: it.base, color: it.color || null, underline: !!it.underline });
+  }
+  return runs;
+}
+
+function splitLineItems(content, fs0) {
+  const header = findItemHeader(content.tables);
+  if (!header) return;
+  const { table, cols } = header;
+  const left = cols[0].x0 - 6, right = cols[cols.length - 1].x1 + 6;
+  const below = table.rect.y1 - 1;
+  const nextTable = Math.min(Infinity, ...content.tables.filter((t) => t !== table && t.rect.y0 > below).map((t) => t.rect.y0));
+  // code / description columns carry wrapped text; every other column (quantity,
+  // prices) marks the line where an item starts
+  const dataCol = cols.map((c) => !/code|item|descr|part/i.test(c.text || ''));
+  const colOf = (it) => {
+    const cx = (it.x0 + it.x1) / 2;
+    const inside = cols.findIndex((c) => cx >= c.x0 - 2 && cx <= c.x1 + 2);
+    if (inside >= 0) return inside;
+    let best = 0;
+    cols.forEach((c, i) => { if (Math.abs(cx - (c.x0 + c.x1) / 2) < Math.abs(cx - (cols[best].x0 + cols[best].x1) / 2)) best = i; });
+    return best;
+  };
+  const mine = [];
+  const out = [];
+  for (const entry of content.lines) {
+    const { line } = entry;
+    const inRange = line.items?.length && line.top >= below - 2 && line.bottom <= nextTable + 2 && line.x0 >= left && line.x1 <= right;
+    if (inRange) mine.push(entry); else out.push(entry);
+  }
+  if (!mine.length) return;
+  mine.sort((p, q) => p.line.top - q.line.top || p.line.x0 - q.line.x0);
+
+  const rows = [];
+  for (const { line } of mine) {
+    const byCol = new Map();
+    for (const it of line.items) {
+      const k = colOf(it);
+      if (!byCol.has(k)) byCol.set(k, []);
+      byCol.get(k).push(it);
+    }
+    const hasData = [...byCol.keys()].some((k) => dataCol[k]);
+    const last = rows[rows.length - 1];
+    const piece = (its) => ({ items: its, runs: runsFromItems(its), tabs: [], base: line.base, fs: line.fs, top: line.top, bottom: line.bottom, x0: its[0].x0, x1: Math.max(...its.map((i) => i.x1)) });
+    let target = null;
+    if (last && Math.abs(line.top - last.lastTop) < 0.5 * line.fs) target = last; // same baseline: more cells of that row
+    else if (last && !hasData && last.hasData && line.top - last.lastTop <= 1.25 * line.fs) target = last; // wrapped text of that row
+    if (target) {
+      for (const [k, its] of byCol) {
+        if (!target.cells.has(k)) target.cells.set(k, []);
+        target.cells.get(k).push(piece(its));
+      }
+      if (line.top > target.lastTop) target.lastTop = line.top;
+      target.hasData = target.hasData || hasData;
+    } else {
+      rows.push({ top: line.top, lastTop: line.top, hasData, cells: new Map([...byCol].map(([k, its]) => [k, [piece(its)]])) });
+    }
+  }
+  for (const row of rows) {
+    for (const [, lines] of [...row.cells].sort((p, q) => p[0] - q[0])) {
+      lines.sort((p, q) => p.top - q.top);
+      const first = { ...lines[0], cellLines: lines };
+      out.push({ line: first, para: { lines, align: 'left' } });
+    }
+  }
+  content.lines = out;
+}
+
 async function buildPageSheet(wb, engine, idx, name, opts, warnings) {
   const a = await analysePage(engine, idx);
   try {
@@ -557,6 +679,7 @@ async function buildPageSheet(wb, engine, idx, name, opts, warnings) {
     const ws = wb.addWorksheet(name, { views: [{ showGridLines: false }] });
     const content = { lines: [], tables: [], pictures: [] };
     collectPageContent(a.tree, content);
+    splitLineItems(content, a.fs0);
 
     // --- columns: table edges first (exact), then left edges of loose text
     const xTable = [];
@@ -622,7 +745,8 @@ async function buildPageSheet(wb, engine, idx, name, opts, warnings) {
         if (r2 > r1 || c2 > c1) ws.mergeCells(r1, c1, r2, c2);
         styleTableCell(ws, cell, r1, c1, r2, c2);
         const master = ws.getCell(r1, c1);
-        setCellText(master, cell.paragraphs || [], { wrap: true });
+        const numInfo = setCellText(master, cell.paragraphs || [], { wrap: true });
+        if (numInfo) ensureWidth(ws, c1, c2, numberWidthFor(numInfo.text, numInfo.fs));
         if (r2 === r1 && cell.paragraphs?.length) needRow(r1, neededHeight(cell.paragraphs));
         if (cell.contentRect && cell.paragraphs?.length) {
           const topGap = cell.contentRect.y0 - cell.rect.y0;
@@ -655,12 +779,14 @@ async function buildPageSheet(wb, engine, idx, name, opts, warnings) {
     });
     for (const l of loose) {
       const cell = ws.getCell(l.r, l.c);
-      const text = lineTextOf(l.line);
+      const text = (l.line.cellLines || [l.line]).map(lineTextOf).reduce((m, t) => (t.length > m.length ? t : m), '');
       const fs = Math.max(...l.line.runs.map((r) => r.fs));
       const est = text.length * 0.5 * fs;
       const own = colBounds[l.c] - colBounds[l.c - 1];
       const avail = colBounds[l.cEnd] - colBounds[l.c - 1];
-      setCellText(cell, [{ lines: [l.line], align: 'left' }], { wrap: false });
+      const cellLines = l.line.cellLines || [l.line];
+      const numInfo = setCellText(cell, [{ lines: cellLines, align: 'left' }], { wrap: cellLines.length > 1 });
+      if (numInfo) ensureWidth(ws, l.c, l.cEnd > l.c && est > own * 0.98 ? l.cEnd : l.c, numberWidthFor(numInfo.text, numInfo.fs));
       let shrink = false;
       if (est > own * 0.98 && l.cEnd > l.c) {
         ws.mergeCells(l.r, l.c, l.r, l.cEnd);
@@ -669,8 +795,13 @@ async function buildPageSheet(wb, engine, idx, name, opts, warnings) {
       } else if (est > own * 1.02 && l.cEnd === l.c) {
         shrink = true;
       }
-      cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: false, shrinkToFit: shrink };
-      needRow(l.r, 1.25 * fs + 1);
+      if (cellLines.length > 1) {
+        cell.alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+        needRow(l.r, neededHeight([{ lines: cellLines }]));
+      } else {
+        cell.alignment = { horizontal: 'left', vertical: 'middle', wrapText: false, shrinkToFit: shrink };
+        needRow(l.r, 1.25 * fs + 1);
+      }
     }
     for (const [r, h] of need) {
       const row = ws.getRow(r);
@@ -721,7 +852,8 @@ async function buildTableSheets(wb, engine, idx, usedNames, opts, warnings) {
         const r1 = cell.r + 1, c1 = cell.c + 1, r2 = cell.r + cell.rs, c2 = cell.c + cell.cs;
         if (r2 > r1 || c2 > c1) ws.mergeCells(r1, c1, r2, c2);
         styleTableCell(ws, cell, r1, c1, r2, c2);
-        setCellText(ws.getCell(r1, c1), cell.paragraphs || [], { wrap: true });
+        const numInfo = setCellText(ws.getCell(r1, c1), cell.paragraphs || [], { wrap: true });
+        if (numInfo) ensureWidth(ws, c1, c2, numberWidthFor(numInfo.text, numInfo.fs));
         if (r2 === r1 && cell.paragraphs?.length) {
           const row = ws.getRow(r1);
           row.height = Math.min(409, Math.max(row.height || 0, neededHeight(cell.paragraphs)));
